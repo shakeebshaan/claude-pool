@@ -1,6 +1,6 @@
 {
   "name": "claude-pool",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Pool several Claude subscriptions for Claude Code: auto-switch accounts on 5-hour / weekly usage limits and resume the same session, desktop widget with every account's limits, one-click login, auto hi at every 5h reset. One file, zero dependencies.",
   "main": "claude-pool.js",
   "bin": {

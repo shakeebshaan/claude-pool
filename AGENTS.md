@@ -15,3 +15,6 @@
   account names only.
 - Keep `README.md`, the header comment in `claude-pool.js` (printed by `cpool help`) and `llms.txt` in sync when
   commands change.
+- **Encoding.** Files are UTF-8 without BOM, LF line endings; `claude-pool.js` must start with its `#!` line (a test
+  checks this). Never round-trip a file through Windows PowerShell 5.1 `Get-Content`/`Set-Content`: it reads BOM-less
+  UTF-8 as ANSI and rewrites every non-ASCII character (`·` becomes `Â·`) and adds a BOM.

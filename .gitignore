@@ -1,6 +1,8 @@
 # never commit a pool folder, tokens or logs
 .claude-pool/
 accounts.json
+accounts.json.bak
+*.bak
 state.json
 snapshot.json
 login.json

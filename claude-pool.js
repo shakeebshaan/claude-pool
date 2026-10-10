@@ -46,7 +46,9 @@ COMMANDS
                                    for the widget every 15 s. One daemon per pool folder. --widget keeps the
                                    desktop widget alive (Windows).
   cpool background [on|off]        Windows: run the daemon (every 2 min) + the desktop widget hidden, now and at
-                                   every logon (HKCU Run -> wscript background.vbs). No argument = status.
+                                   every sign-in (Task Scheduler logon task that also re-checks every 10 min as a
+                                   watchdog, plus an HKCU Run entry as backup; both run wscript background.vbs).
+                                   No argument = status.
   cpool widget [stop]              show / close the transparent desktop widget (drag to move, right-click for
                                    refresh, add account, re-login account, auto hi, background, lock position, close)
   cpool shim [on|off]              Windows: make plain `claude` start through the pool in new terminals (a small
@@ -65,8 +67,9 @@ STORAGE   %USERPROFILE%\.claude-pool\   accounts.json (tokens - never printed, o
 
 ENV OVERRIDES   CLAUDE_POOL_HOME, CLAUDE_POOL_CLAUDE_BIN (path to claude.exe / claude.cmd), CLAUDE_POOL_PROBE_URL
           (API base, default https://api.anthropic.com), CLAUDE_POOL_POLL_MS, CLAUDE_POOL_CACHE_MS (usage cache,
-          default 60000), CLAUDE_POOL_CONTINUE=0 (same as --pool-no-continue), CLAUDE_POOL_NO_SYSTEM=1 (never touch
-          the registry / ACLs / PATH - for tests).
+          default 60000), CLAUDE_POOL_CONTINUE=0 (same as --pool-no-continue), CLAUDE_POOL_AUTO_HI=0 (no auto hi),
+          CLAUDE_POOL_LOGIN_BROWSER=private|normal|none, CLAUDE_POOL_PROBE_MODEL (limit-probe model; falls back if
+          retired), CLAUDE_POOL_NO_SYSTEM=1 (never touch the registry / ACLs / PATH - for tests).
 
 LIMITATIONS
   - Only sessions started through cpool swap live. A plain `claude` started in some other window keeps the token
@@ -105,7 +108,7 @@ const PROBE_INFLIGHT_MS = 25000;
 const UA = "claude-code/2.1.293";
 const PROBE_MODEL = "claude-haiku-5-5";
 const DEFAULT_CONTINUE_PROMPT = "continue where you left off";
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 // daemon + desktop widget
 const SNAPSHOT_FILE = path.join(HOME, "snapshot.json");
 const REFRESH_FLAG = path.join(HOME, "refresh.flag");
@@ -139,9 +142,16 @@ const redact = (s) => String(s).replace(TOKEN_RE_G, (m) => "sk-ant-...." + m.sli
 const out = (s = "") => process.stdout.write(redact(s) + "\n");
 const err = (s = "") => process.stderr.write(redact(s) + "\n");
 const tail = (t) => (t ? "..." + String(t).slice(-4) : "----");
+// pool.log rotates at 2 MB (one previous file kept as pool.log.1) so a long-running daemon never fills the disk
+let logWrites = 0;
 function log(line) {
   try {
     ensureHome();
+    if (logWrites++ % 200 === 0) {
+      try {
+        if (fs.statSync(LOG_FILE).size > 2 * 1024 * 1024) fs.renameSync(LOG_FILE, LOG_FILE + ".1");
+      } catch {}
+    }
     fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} [${process.pid}] ${redact(line)}\n`);
   } catch {}
 }
@@ -239,15 +249,20 @@ function lockDown() {
   } catch {}
 }
 
-function readJson(file, fallback) {
-  for (let i = 0; i < 5; i++) {
+// strict: a file that exists but cannot be read or parsed is an error, never "empty" - used for accounts.json, where
+// treating it as empty would let the next write replace every stored token with nothing.
+function readJson(file, fallback, { strict = false } = {}) {
+  let last = null;
+  for (let i = 0; i < 8; i++) {
     try {
-      return JSON.parse(fs.readFileSync(file, "utf8"));
+      return JSON.parse(fs.readFileSync(file, "utf8").replace(/^\ufeff/, "")); // tolerate a BOM added by an editor
     } catch (e) {
       if (e.code === "ENOENT") return fallback();
-      sleepSync(15 + i * 15); // a writer may be mid-rename (Windows) - retry a few times
+      last = e;
+      sleepSync(15 + i * 25); // a writer may be mid-rename or an antivirus scan may hold it (Windows) - retry
     }
   }
+  if (strict) throw new Error(`${path.basename(file)} cannot be read (${(last && last.message) || last}) - fix it, or restore ${path.basename(file)}.bak next to it`);
   return fallback();
 }
 function writeJsonAtomic(file, obj) {
@@ -273,17 +288,28 @@ function writeJsonAtomic(file, obj) {
     }
   }
 }
-// Cross-process lock: mkdir is atomic everywhere. Stale = owner pid gone or older than LOCK_STALE_MS.
+// Cross-process lock: mkdir is atomic everywhere. Stale = owner pid gone or older than LOCK_STALE_MS. The owner file
+// holds pid + nonce: release only removes our own lock (never one taken over while we were suspended), and a stale lock
+// is re-checked right before it is moved away, so two waiters cannot both break it and both proceed.
 function acquireLock(timeoutMs = 15000) {
   const ownerFile = path.join(LOCK_DIR, "owner");
+  const me = `${process.pid}:${crypto.randomBytes(6).toString("hex")}`;
+  const owner = () => {
+    try {
+      return fs.readFileSync(ownerFile, "utf8");
+    } catch {
+      return "";
+    }
+  };
   const start = Date.now();
   for (;;) {
     try {
       fs.mkdirSync(LOCK_DIR);
       try {
-        fs.writeFileSync(ownerFile, String(process.pid));
+        fs.writeFileSync(ownerFile, me);
       } catch {}
       return () => {
+        if (owner() !== me) return; // taken over meanwhile: not ours to remove
         try {
           fs.rmSync(LOCK_DIR, { recursive: true, force: true });
         } catch {}
@@ -291,17 +317,20 @@ function acquireLock(timeoutMs = 15000) {
     } catch (e) {
       if (e.code !== "EEXIST") throw e;
       let stale = false;
+      const seen = owner();
       try {
         const st = fs.statSync(LOCK_DIR);
         if (Date.now() - st.mtimeMs > LOCK_STALE_MS) stale = true;
         else {
-          const pid = Number(fs.readFileSync(ownerFile, "utf8"));
+          const pid = Number(seen.split(":")[0]);
           if (pid && pid !== process.pid && !pidAlive(pid) && Date.now() - st.mtimeMs > 500) stale = true;
         }
       } catch {}
-      if (stale) {
+      if (stale && owner() === seen) {
+        const grave = `${LOCK_DIR}.stale-${process.pid}-${Date.now()}`;
         try {
-          fs.rmSync(LOCK_DIR, { recursive: true, force: true });
+          fs.renameSync(LOCK_DIR, grave); // atomic: only one waiter wins
+          fs.rmSync(grave, { recursive: true, force: true });
         } catch {}
         continue;
       }
@@ -328,7 +357,11 @@ function normalizeState(s) {
   s.sessions = s.sessions && typeof s.sessions === "object" ? s.sessions : {};
   return s;
 }
-const loadAccounts = () => normalizeAccounts(readJson(ACCOUNTS_FILE, defaultAccounts));
+function loadAccounts() {
+  const raw = readJson(ACCOUNTS_FILE, defaultAccounts, { strict: true });
+  if (!raw || !Array.isArray(raw.accounts)) throw new Error("accounts.json has no account list - fix it, or restore accounts.json.bak next to it");
+  return normalizeAccounts(raw);
+}
 const loadState = () => normalizeState(readJson(STATE_FILE, defaultState));
 // Read-modify-write both files under the lock. fn(accountsDoc, stateDoc) may mutate; only changed docs are written.
 function withLock(fn) {
@@ -341,7 +374,12 @@ function withLock(fn) {
     // drop sessions whose process is gone
     for (const k of Object.keys(st.sessions)) if (!pidAlive(Number(k))) delete st.sessions[k];
     const r = fn(acc, st);
-    if (JSON.stringify(acc) !== a0) writeJsonAtomic(ACCOUNTS_FILE, acc);
+    if (JSON.stringify(acc) !== a0) {
+      try {
+        if (fs.existsSync(ACCOUNTS_FILE)) fs.copyFileSync(ACCOUNTS_FILE, ACCOUNTS_FILE + ".bak"); // last good copy
+      } catch {}
+      writeJsonAtomic(ACCOUNTS_FILE, acc);
+    }
     if (JSON.stringify(st) !== s0) writeJsonAtomic(STATE_FILE, st);
     return r;
   } finally {
@@ -351,11 +389,14 @@ function withLock(fn) {
 
 // ---------------------------------------------------------------- accounts
 const newId = () => "a" + Date.now().toString(36) + crypto.randomBytes(3).toString("hex");
-function findAccount(doc, ref) {
+// An exact name always wins; a number is a 1-based position only when no account has that name (byIndex: false for
+// "find or create by name" - a login for an account called "2" must never land on the second account).
+function findAccount(doc, ref, { byIndex = true } = {}) {
   if (ref == null) return null;
   const s = String(ref).trim();
-  if (/^\d+$/.test(s)) return doc.accounts[Number(s) - 1] || null;
-  return doc.accounts.find((a) => a.name.toLowerCase() === s.toLowerCase()) || null;
+  const named = doc.accounts.find((a) => a.name.toLowerCase() === s.toLowerCase());
+  if (named || !byIndex || !/^\d+$/.test(s)) return named || null;
+  return doc.accounts[Number(s) - 1] || null;
 }
 const accountUsable = (a, now = Date.now()) => a.enabled && !!a.token && !a.dead && !(a.pausedUntil > now);
 function statusOf(a, now = Date.now(), inUse = 0) {
@@ -375,29 +416,40 @@ function liveSessionsByAccount(state) {
 // ---------------------------------------------------------------- limit probe (copied from the bot's status-panel)
 // Setup tokens get 429 from /api/oauth/usage, but every /v1/messages answer carries
 // anthropic-ratelimit-unified-{5h,7d}-{utilization,reset} headers; a 1-token haiku call reads them.
+// If a model id is retired the probe would 404 forever and limits would never be seen: fall back to the next id and
+// remember the one that works (CLAUDE_POOL_PROBE_MODEL overrides the first choice).
+const PROBE_MODELS = [...new Set([process.env.CLAUDE_POOL_PROBE_MODEL || PROBE_MODEL, PROBE_MODEL, "claude-haiku-4-5"])];
+let probeModelIdx = 0;
 async function probeToken(token) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 20000);
   const base = { at: Date.now(), http: 0, session: null, weekly: null, rateLimited: false, dead: false, error: null, retryAt: null };
   try {
-    const r = await fetch(`${API}/v1/messages`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "anthropic-beta": "oauth-2025-04-20",
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-        "User-Agent": UA,
-      },
-      body: JSON.stringify({
-        model: PROBE_MODEL,
-        max_tokens: 1,
-        system: "You are Claude Code, Anthropic's official CLI for Claude.",
-        messages: [{ role: "user", content: "hi" }],
-      }),
-      signal: ctl.signal,
-    });
-    const text = await r.text().catch(() => "");
+    let r, text;
+    for (let tries = 0; tries < PROBE_MODELS.length; tries++) {
+      r = await fetch(`${API}/v1/messages`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "anthropic-beta": "oauth-2025-04-20",
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+          "User-Agent": UA,
+        },
+        body: JSON.stringify({
+          model: PROBE_MODELS[probeModelIdx],
+          max_tokens: 1,
+          system: "You are Claude Code, Anthropic's official CLI for Claude.",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+        signal: ctl.signal,
+      });
+      text = await r.text().catch(() => "");
+      const modelGone = r.status === 404 && /not_found_error/.test(text) && !r.headers.get("anthropic-ratelimit-unified-5h-utilization");
+      if (!modelGone) break;
+      log(`probe model ${PROBE_MODELS[probeModelIdx]} not found - trying the next one`);
+      probeModelIdx = (probeModelIdx + 1) % PROBE_MODELS.length;
+    }
     const h = (k) => r.headers.get(k);
     const win = (p) => {
       const u = h(`anthropic-ratelimit-unified-${p}-utilization`);
@@ -489,11 +541,14 @@ function headroom(u) {
   const w = u.weekly ? 100 - u.weekly.used : 100;
   return Math.max(0, Math.min(s, w));
 }
+// How long an exhausted account stays paused. Only reset times still ahead count; an exhausted window whose announced
+// reset has just passed (PC clock a little ahead of the server) is re-checked in a minute, not parked for 30.
+const SHORT_PAUSE_MS = 60000;
+const AUTH_RECHECK_MS = Math.max(0, num(process.env.CLAUDE_POOL_AUTH_RECHECK_MS, 5000)); // tests shorten it
 function pauseUntilFor(u, now = Date.now()) {
-  const resets = [];
-  for (const w of [u.session, u.weekly]) if (w && w.used >= EXHAUSTED_PCT && w.resetsAt) resets.push(w.resetsAt);
-  let until = resets.length ? Math.max(...resets) : u.retryAt || 0;
-  if (!until || until <= now) until = now + DEFAULT_PAUSE_MS;
+  const future = [], passed = [];
+  for (const w of [u.session, u.weekly]) if (w && w.used >= EXHAUSTED_PCT && w.resetsAt) (w.resetsAt > now ? future : passed).push(w.resetsAt);
+  let until = future.length ? Math.max(...future) : u.retryAt > now ? u.retryAt : passed.length ? now + SHORT_PAUSE_MS : now + DEFAULT_PAUSE_MS;
   return Math.min(now + MAX_PAUSE_MS, Math.max(now + 5000, until));
 }
 // Write what a reading means into the account (called under the lock).
@@ -542,15 +597,28 @@ async function getUsage(a, { maxAge = CACHE_MS } = {}) {
       if (c && !c.probingAt && c.at >= now - maxAge) return c;
     }
   }
-  const v = await probeToken(a.token);
+  let v = await probeToken(a.token);
+  if (v.dead) {
+    // one 401 can be a server-side blip: confirm before an account is marked "login expired" and sessions are killed
+    await sleep(AUTH_RECHECK_MS);
+    const again = await probeToken(a.token);
+    if (!again.dead) v = again;
+  }
   return withLock((acc, st) => {
+    const cur = acc.accounts.find((x) => x.id === a.id);
+    if (cur && cur.token !== a.token) {
+      // the account was re-logged while this probe ran: this reading is about the old token - keep it out of the pool
+      const u = st.usage[a.id];
+      if (u && u.probingAt) delete u.probingAt;
+      return { ...v, staleToken: true };
+    }
     const prev = st.usage[a.id] || null;
     let outv = v;
     const transient = v.error && !hasData(v) && !v.dead && !v.rateLimited;
     if (transient && prev && hasData(prev)) outv = { ...prev, at: Date.now(), stale: true, error: v.error };
     delete outv.probingAt;
     st.usage[a.id] = outv;
-    applyReading(acc.accounts.find((x) => x.id === a.id), outv);
+    applyReading(cur, outv);
     return outv;
   });
 }
@@ -589,10 +657,18 @@ function earliestReset() {
 // ---------------------------------------------------------------- claude binary + launching
 // Pure. The real claude among the candidates: never one of our own shims (cpool shim puts a claude.exe into
 // HOME/bin, first on PATH - launching it would loop back into cpool). .exe beats .cmd.
-function chooseClaude(candidates, ownBin, exists = fs.existsSync) {
-  const own = path.resolve(ownBin).toLowerCase();
-  const real = candidates.filter((p) => path.resolve(path.dirname(p)).toLowerCase() !== own && exists(p));
+function chooseClaude(candidates, ownBin, exists = fs.existsSync, isShim = isOurShim) {
+  const own = [].concat(ownBin).map((d) => path.resolve(d).toLowerCase());
+  const real = candidates.filter((p) => !own.includes(path.resolve(path.dirname(p)).toLowerCase()) && exists(p) && !isShim(p));
   return real.find((p) => /\.exe$/i.test(p)) || real.find((p) => /\.cmd$/i.test(p)) || real[0] || null;
+}
+// our own claude.exe shim, wherever it is (another CLAUDE_POOL_HOME, a copied bin folder): small, carries its class name
+function isOurShim(p) {
+  try {
+    return fs.statSync(p).size < 512 * 1024 && fs.readFileSync(p).includes("ClaudePoolShim");
+  } catch {
+    return false;
+  }
 }
 function resolveClaude() {
   const envBin = process.env.CLAUDE_POOL_CLAUDE_BIN;
@@ -600,13 +676,12 @@ function resolveClaude() {
   const home = os.homedir();
   const candidates = [];
   if (IS_WIN) {
-    try {
-      const r = spawnSync("where", ["claude"], { encoding: "utf8", windowsHide: true });
-      if (r.status === 0) candidates.push(...r.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
-    } catch {}
+    // PATH only - not `where`, which looks in the current folder first: a claude.exe dropped into a cloned repo must
+    // never be started with a pool token
+    for (const d of (process.env.PATH || "").split(";").filter(Boolean)) for (const n of ["claude.exe", "claude.cmd"]) candidates.push(path.join(d.replace(/^"|"$/g, ""), n));
     candidates.push(path.join(home, ".local", "bin", "claude.exe"));
     if (process.env.APPDATA) candidates.push(path.join(process.env.APPDATA, "npm", "claude.cmd"));
-    return chooseClaude(candidates, path.join(HOME, "bin")) || "claude.cmd";
+    return chooseClaude(candidates, [path.join(HOME, "bin"), path.join(path.dirname(__filename), "bin")]) || "claude.cmd";
   }
   try {
     const r = spawnSync("sh", ["-lc", "command -v claude"], { encoding: "utf8" });
@@ -622,12 +697,29 @@ function childEnv(token) {
   env.CLAUDE_CODE_OAUTH_TOKEN = token;
   return env;
 }
-const winQuote = (s) => (/[\s"&|<>^()]/.test(s) || s === "" ? `"${s.replace(/"/g, '\\"')}"` : s);
-function launchClaude(bin, args, token) {
-  const env = childEnv(token);
-  const needsShell = IS_WIN && /\.(cmd|bat)$/i.test(bin);
-  if (needsShell) return spawn([bin, ...args].map(winQuote).join(" "), { stdio: "inherit", env, shell: true });
-  return spawn(bin, args, { stdio: "inherit", env });
+// How to start claude without cmd.exe. npm installs `claude.cmd`, a stub that runs node on the package's entry script
+// (or its native binary); going through cmd.exe would re-parse every argument (`&`, `|`, `%VAR%`, quotes), so a prompt
+// could run commands. Read the target out of the stub instead and start it directly.
+function claudeCommand(bin) {
+  if (!(IS_WIN && /\.(cmd|bat)$/i.test(bin))) return { file: bin, pre: [] };
+  try {
+    const stub = fs.readFileSync(bin, "utf8");
+    const found = [...stub.matchAll(/"%~?dp0%?\\?([^"%]+\.(?:js|mjs|cjs|exe))"/gi)].map((m) => path.join(path.dirname(bin), m[1])).filter((p) => fs.existsSync(p));
+    const script = found.find((p) => /\.(?:js|mjs|cjs)$/i.test(p));
+    if (script) return { file: process.execPath, pre: [script] };
+    const exe = found.find((p) => /\.exe$/i.test(p) && !/[\\/]node\.exe$/i.test(p)); // the stub also names node.exe itself
+    if (exe) return { file: exe, pre: [] };
+  } catch {}
+  return { file: bin, pre: [], shell: true }; // unknown stub: last resort, arguments are quoted for cmd.exe
+}
+const winQuote = (s) => (/[\s"&|<>^()%!]/.test(s) || s === "" ? `"${s.replace(/(["%!^])/g, "^$1")}"` : s);
+function spawnClaude(bin, args, opts) {
+  const c = claudeCommand(bin);
+  if (c.shell) return spawn([bin, ...args].map(winQuote).join(" "), { ...opts, shell: true });
+  return spawn(c.file, [...c.pre, ...args], opts);
+}
+function launchClaude(bin, args, token, cwd = process.cwd()) {
+  return spawnClaude(bin, args, { stdio: "inherit", env: childEnv(token), cwd });
 }
 function killTree(child) {
   if (!child || child.exitCode != null || child.signalCode) return;
@@ -669,18 +761,67 @@ function restoreTty() {
   } catch {}
 }
 // Newest session file for this cwd (how we learn the id of a `--continue` / picker-resumed session).
+const claudeDir = () => process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+// Claude Code keeps ~/.claude/sessions/<pid>.json per running process with the conversation it is on right now.
+// Our child is claude itself (native claude.exe) or a shell around it (npm claude.cmd); in the second case the entry
+// is found by folder + start time, and must be the only one that matches.
+function childSession(childPid, cwd, sinceMs, knownPid = null, parentOf = parentPid) {
+  const dir = path.join(claudeDir(), "sessions");
+  const read = (pid) => {
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(dir, `${pid}.json`), "utf8"));
+      // a file left by an earlier process whose pid Windows has since reused started before our launch: not ours
+      return j && j.sessionId && !(j.startedAt < sinceMs - 5000) ? { pid, sessionId: j.sessionId, cwd: j.cwd || null } : null;
+    } catch {
+      return null;
+    }
+  };
+  const direct = read(knownPid || childPid);
+  if (direct || knownPid) return direct;
+  try {
+    const hits = [];
+    for (const f of fs.readdirSync(dir)) {
+      if (!/^\d+\.json$/.test(f)) continue;
+      try {
+        const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+        if (j.sessionId && j.cwd && j.cwd.toLowerCase() === cwd.toLowerCase() && j.startedAt >= sinceMs && j.startedAt <= sinceMs + 60000) hits.push({ pid: j.pid, sessionId: j.sessionId, cwd: j.cwd });
+      } catch {}
+    }
+    // must be our own claude: the process our shell child started (another window may have started in this folder too)
+    const ours = hits.filter((h) => parentOf(h.pid) === childPid);
+    return ours.length === 1 ? ours[0] : null;
+  } catch {
+    return null;
+  }
+}
+// parent pid of a process (Windows), 0 if unknown
+function parentPid(pid) {
+  if (!IS_WIN) {
+    try {
+      return Number(spawnSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim()) || 0;
+    } catch {
+      return 0;
+    }
+  }
+  const r = psRun("(Get-CimInstance Win32_Process -Filter ('ProcessId=' + $env:CPOOL_PID)).ParentProcessId", { CPOOL_PID: String(pid) });
+  return Number((r.stdout || "").trim()) || 0;
+}
+// Is a conversation saved under this id in any project folder? (claude --resume <id> finds it from any folder)
+function transcriptExists(id) {
+  const root = path.join(claudeDir(), "projects");
+  try {
+    return fs.readdirSync(root).some((d) => fs.existsSync(path.join(root, d, `${id}.jsonl`)));
+  } catch {
+    return false;
+  }
+}
+// Last resort when the registry gave nothing: the conversation written in this folder since the launch - only if it
+// is the only one (several claude windows in one folder must never resume each other's conversation).
 function findLatestSession(cwd, sinceMs) {
   try {
-    const cfg = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
-    const dir = path.join(cfg, "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"));
-    let best = null;
-    for (const f of fs.readdirSync(dir)) {
-      if (!/^[0-9a-f-]{36}\.jsonl$/i.test(f)) continue;
-      const st = fs.statSync(path.join(dir, f));
-      if (st.mtimeMs < sinceMs - 2000) continue;
-      if (!best || st.mtimeMs > best.m) best = { id: f.slice(0, -6), m: st.mtimeMs };
-    }
-    return best ? best.id : null;
+    const dir = path.join(claudeDir(), "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"));
+    const hits = fs.readdirSync(dir).filter((f) => /^[0-9a-f-]{36}\.jsonl$/i.test(f) && fs.statSync(path.join(dir, f)).mtimeMs >= sinceMs - 2000);
+    return hits.length === 1 ? hits[0].slice(0, -6) : null;
   } catch {
     return null;
   }
@@ -707,7 +848,11 @@ function parseRunArgs(argv) {
     pollMs: POLL_MS,
     account: null,
   };
-  const a = argv.slice();
+  // "--resume=<id>" / "--session-id=<id>" / "--worktree=<name>" = the two-word forms
+  const a = argv.flatMap((x) => {
+    const m = /^(--resume|--session-id|--worktree|--model|--add-dir)=(.*)$/.exec(x);
+    return m ? [m[1], m[2]] : [x];
+  });
   for (let i = 0; i < a.length; i++) {
     const x = a[i];
     const next = () => (i + 1 < a.length && !a[i + 1].startsWith("-") ? a[++i] : null);
@@ -734,7 +879,11 @@ function parseRunArgs(argv) {
       o.mode = "continue";
       o.claudeArgs.push(x);
     } else if (x === "--fork-session") o.claudeArgs.push(x);
-    else if (x.startsWith("-")) {
+    else if (x === "-w" || x === "--worktree") {
+      // first launch only: a relaunch runs inside that worktree's folder (see cmdRun) - repeating -w would make a new one
+      o.claudeArgs.push(x);
+      if (i + 1 < a.length && !a[i + 1].startsWith("-")) o.claudeArgs.push(a[++i]);
+    } else if (x.startsWith("-")) {
       o.claudeArgs.push(x);
       o.passFlags.push(x);
       if (VALUE_FLAGS.has(x) && i + 1 < a.length) {
@@ -783,8 +932,10 @@ async function waitForReset(interruptRef) {
   out(`[pool] all ${total} accounts are out of limit - soonest: ${e.account.name} resets at ${fmtClock(e.at)} (in ${fmtLeft(e.at - Date.now())}). Waiting; Ctrl+C to stop.`);
   log(`waiting for ${e.account.name} until ${new Date(e.at).toISOString()}`);
   const tty = process.stdout.isTTY;
-  while (Date.now() < e.at + 1500) {
+  for (let tick = 0; Date.now() < e.at + 1500; tick++) {
     if (interruptRef.interrupted) return false;
+    // an account may come back early (auto hi, a reset sooner than announced, a re-login): stop waiting then
+    if (tick > 0 && tick % 15 === 0 && loadAccounts().accounts.some((a) => accountUsable(a))) break;
     const line = `[pool] resuming on ${e.account.name} in ${fmtCountdown(e.at + 1500 - Date.now())}`;
     if (tty) process.stdout.write(`\r${line.padEnd(70)}`);
     else if (Math.floor((e.at + 1500 - Date.now()) / 1000) % 30 === 0) out(line);
@@ -809,7 +960,8 @@ async function cmdRun(argv) {
   let sessionId = o.sessionId || (o.mode === "new" ? crypto.randomUUID() : null);
   let launches = 0, swaps = 0;
   let child = null;
-  let pendingSwap = null; // { from, reason }
+  let pendingSwap = null; // { from, reason, waited }
+  let runCwd = process.cwd(); // after a swap: the folder the conversation was running in (a -w worktree, say)
   const intr = { interrupted: false };
   const onSigint = () => {
     if (child) return; // claude owns the terminal; it handles Ctrl+C itself
@@ -832,7 +984,8 @@ async function cmdRun(argv) {
           picked = null;
         }
       }
-      if (!picked) picked = await pickBest({ exclude: pendingSwap ? [pendingSwap.from.id] : [] });
+      // right after a swap the exhausted account is left out - but not once we have waited for its reset
+      if (!picked) picked = await pickBest({ exclude: pendingSwap && !pendingSwap.waited ? [pendingSwap.from.id] : [] });
       if (!picked) {
         if (!earliestReset()) {
           err("[pool] no usable account: every account is off or its login expired. `cpool limits` / `cpool add`.");
@@ -840,6 +993,7 @@ async function cmdRun(argv) {
         }
         const ok = await waitForReset(intr);
         if (!ok) return 130;
+        if (pendingSwap) pendingSwap.waited = true;
         continue;
       }
       const a = picked.account;
@@ -855,19 +1009,37 @@ async function cmdRun(argv) {
       } else {
         out(`[pool] ${a.name} (${leftTxt(picked.usage)}) - session ${sessionId || "(claude picks)"}`);
       }
-      const args = buildArgs(o, launches, sessionId);
+      let args = buildArgs(o, launches, sessionId);
+      if (launches > 0 && (!sessionId || !transcriptExists(sessionId))) {
+        // Nothing saved under that id (an empty session), or the conversation could not be identified: resuming would
+        // fail, and --continue could pick up another window's conversation in this folder - start fresh instead.
+        log(sessionId ? `no transcript for session ${sessionId} - starting a new session` : "conversation unknown - starting a new session");
+        out(`[pool] ${sessionId ? `no saved conversation for session ${sessionId}` : "could not tell which conversation to resume"} - starting a new session on ${a.name}`);
+        sessionId = crypto.randomUUID();
+        args = [...o.passFlags, "--session-id", sessionId];
+      }
       const startedAt = Date.now();
       registerSession(a.id, sessionId);
       let swapping = null;
-      child = launchClaude(bin, args, a.token);
-      log(`launch #${launches + 1} on ${a.name} pid ${child.pid}: ${bin} ${args.join(" ")}`);
+      child = launchClaude(bin, args, a.token, runCwd);
+      log(`launch #${launches + 1} on ${a.name} pid ${child.pid}: ${bin} ${args.join(" ")}${runCwd !== process.cwd() ? ` (in ${runCwd})` : ""}`);
+      // Follow the conversation claude is actually on: /resume or /clear inside claude switch it to another id.
+      const tracked = { pid: null, sessionId: null, cwd: null };
+      const launchCwd = runCwd;
+      const track = () => {
+        const s = child && childSession(child.pid, launchCwd, startedAt, tracked.pid);
+        if (s) Object.assign(tracked, s);
+      };
+      const tracker = setInterval(track, 3000);
+      const me = child; // a check that finishes after this launch ended must never touch the next one
       const monitor = setInterval(async () => {
-        if (!child || swapping) return;
+        if (child !== me || swapping) return;
         try {
           const u = await getUsage(a, { maxAge: Math.min(CACHE_MS, o.pollMs) });
           const j = judge(u);
-          if (child && !swapping && (j === "limited" || j === "dead")) {
+          if (child === me && !swapping && (j === "limited" || j === "dead")) {
             swapping = j;
+            track(); // last look before the process goes
             withLock((acc) => applyReading(acc.accounts.find((x) => x.id === a.id), u));
             log(`monitor: ${a.name} is ${j} (${u.error || leftTxt(u)}) - killing pid ${child.pid}`);
             killTree(child);
@@ -878,6 +1050,12 @@ async function cmdRun(argv) {
       }, o.pollMs);
       const res = await waitExit(child);
       clearInterval(monitor);
+      clearInterval(tracker);
+      if (tracked.sessionId && tracked.sessionId !== sessionId) {
+        log(`session ${sessionId || "(new)"} -> ${tracked.sessionId} (switched inside claude)`);
+        sessionId = tracked.sessionId;
+      }
+      if (tracked.cwd && fs.existsSync(tracked.cwd)) runCwd = tracked.cwd;
       child = null;
       launches++;
       unregisterSession();
@@ -886,7 +1064,7 @@ async function cmdRun(argv) {
         err(`[pool] could not start claude (${bin}): ${res.error.message}. Set CLAUDE_POOL_CLAUDE_BIN to the claude executable.`);
         return 127;
       }
-      if (!sessionId) sessionId = findLatestSession(process.cwd(), startedAt);
+      if (!sessionId) sessionId = findLatestSession(launchCwd, startedAt);
       if (swapping) {
         pendingSwap = { from: a, reason: swapping };
         swaps++;
@@ -977,7 +1155,7 @@ function rowStatus(a, u, now, sessions, active) {
   if (!hasData(u)) return { text: u && u.error ? "no data" : "checking", kind: "unknown" };
   return { text: "ready", kind: "ready" };
 }
-// "first acct2 in 36m · all in 4h56 (09:20)": soonest and latest reset among accounts that used that window.
+// "first acct2 in 36m - all in 4h56 (09:20)": soonest and latest reset among accounts that used that window.
 function resetLine(pool, usage, key, now) {
   const c = [];
   let any = false;
@@ -992,7 +1170,7 @@ function resetLine(pool, usage, key, now) {
   const first = c[0], last = c[c.length - 1];
   const clock = fmtClock(last.at, now);
   if (c.length === 1) return `${first.name} in ${fmtShort(first.at - now)} (${clock})`;
-  return `first ${first.name} in ${fmtShort(first.at - now)} · all in ${fmtShort(last.at - now)} (${clock})`;
+  return `first ${first.name} in ${fmtShort(first.at - now)} \u00b7 all in ${fmtShort(last.at - now)} (${clock})`;
 }
 // The arrow (active) marks the account new terminals log in with (daemon default) and accounts with live cpool sessions.
 // Usable = weekly budget left across the pool: sum of 7d left / (enabled accounts x 100).
@@ -1029,10 +1207,10 @@ function buildSnapshot(accDoc, state, now = Date.now(), login = null, queue = []
   }
   const pct = pool.length ? left7 / pool.length : 0;
   const filled = Math.max(0, Math.min(BAR_CELLS, Math.round((pct / 100) * BAR_CELLS)));
-  const eq = Math.floor(Math.round(left7) / 10) / 10; // floor: "≈1.2" never overstates
+  const eq = Math.floor(Math.round(left7) / 10) / 10; // floor: "~1.2" never overstates
   const loggedIn = pool.filter((a) => a.token && !a.dead).length;
   const waiting = pool.length > 0 && loggedIn === 0; // placeholder text until the first login
-  const hiText = !hi.on ? "off - cpool autohi on" : waiting ? "on - starts after you log in" : hi.last ? `on · last ${hi.last.name} at ${fmtClock(hi.last.at, now)}` : "on · sends hi at every 5h reset";
+  const hiText = !hi.on ? "off - cpool autohi on" : waiting ? "on - starts after you log in" : hi.last ? `on \u00b7 last ${hi.last.name} at ${fmtClock(hi.last.at, now)}` : "on \u00b7 sends hi at every 5h reset";
   const def = accDoc.accounts.find((a) => a.id === state.defaultAccountId && a.enabled && a.token);
   const cliEmail = cli && cli.email ? String(cli.email) : "";
   // which pool account IS the /login account: an email you gave it, else its usage windows (never a name guess)
@@ -1041,7 +1219,7 @@ function buildSnapshot(accDoc, state, now = Date.now(), login = null, queue = []
   // matched by usage under a name that is not the mailbox: show the real email so crossed names are visible
   const crossed = cliAcct && !byEmail && cliAcct.name.toLowerCase() !== cliEmail.split("@")[0].toLowerCase();
   const cliText = !cliAcct ? cliEmail : crossed ? `${cliAcct.name} (${cliEmail})` : cliAcct.name;
-  const loginsText = `new terminals → ${def ? def.name : "their own claude /login"}` + (cliEmail ? ` · claude /login → ${cliText}` : "");
+  const loginsText = `new terminals \u2192 ${def ? def.name : "their own claude /login"}` + (cliEmail ? ` \u00b7 claude /login \u2192 ${cliText}` : "");
   return {
     version: 1,
     generatedAt: now,
@@ -1054,8 +1232,8 @@ function buildSnapshot(accDoc, state, now = Date.now(), login = null, queue = []
       accounts: eq,
       total: pool.length,
       text: waiting
-        ? `log in to see usage · 0 of ${pool.length} logged in`
-        : `${Math.round(pct)}% · ≈${eq.toFixed(1)} of ${pool.length} account${pool.length === 1 ? "" : "s"}`,
+        ? `log in to see usage \u00b7 0 of ${pool.length} logged in`
+        : `${Math.round(pct)}% \u00b7 \u2248${eq.toFixed(1)} of ${pool.length} account${pool.length === 1 ? "" : "s"}`,
     },
     resets: waiting
       ? { h5: "after login", d7: "after login" }
@@ -1069,7 +1247,7 @@ function buildSnapshot(accDoc, state, now = Date.now(), login = null, queue = []
 function summaryLines(snap) {
   const u = snap.usable;
   return [
-    `Usable     ${"█".repeat(u.filled)}${"░".repeat(u.cells - u.filled)}  ${u.text}`,
+    `Usable     ${"\u2588".repeat(u.filled)}${"\u2591".repeat(u.cells - u.filled)}  ${u.text}`,
     `5h resets  ${snap.resets.h5}`,
     `7d resets  ${snap.resets.d7}`,
     `Auto hi    ${snap.autoHi.text}`,
@@ -1216,7 +1394,7 @@ function promptHidden(question) {
 // placeholder account (no token yet): shows up as "needs login" with a Log in button on the widget
 function ensureAccount(name, email) {
   return withLock((acc) => {
-    let a = findAccount(acc, name);
+    let a = findAccount(acc, name, { byIndex: false });
     const created = !a;
     if (!a) {
       a = { id: newId(), name: String(name).slice(0, 40), token: null, enabled: true, addedAt: new Date().toISOString(), pausedUntil: 0, pauseNote: "", dead: false, deadReason: "", lastUsedAt: null };
@@ -1313,11 +1491,8 @@ function setUserEnv(value) {
       stdio: "ignore",
       windowsHide: true,
     });
-    if (r.status === 0) return true;
-    const r2 = value
-      ? spawnSync("reg", ["add", "HKCU\\Environment", "/v", "CLAUDE_CODE_OAUTH_TOKEN", "/t", "REG_SZ", "/d", value, "/f"], { stdio: "ignore", windowsHide: true })
-      : spawnSync("reg", ["delete", "HKCU\\Environment", "/v", "CLAUDE_CODE_OAUTH_TOKEN", "/f"], { stdio: "ignore", windowsHide: true });
-    return r2.status === 0;
+    // no reg.exe fallback: it would put the token on a command line (visible to process listings and audit logs)
+    return r.status === 0;
   }
   const f = path.join(HOME, "env.sh");
   fs.writeFileSync(f, value ? `export CLAUDE_CODE_OAUTH_TOKEN='${value}'\n` : "unset CLAUDE_CODE_OAUTH_TOKEN\n", { mode: 0o600 });
@@ -1340,8 +1515,7 @@ async function cmdUse(ref) {
     if (!a) return err(`[pool] no account "${ref}"`), 2;
     if (!a.token) return err(`[pool] ${a.name} is not logged in yet: cpool login ${a.name}`), 2;
   }
-  if (!setUserEnv(a.token)) return err("[pool] could not write the user env var"), 1;
-  withLock((acc, st) => (st.defaultAccountId = a.id));
+  if (!setDefault(a)) return err("[pool] could not write the user env var"), 1;
   out(`[pool] user env var CLAUDE_CODE_OAUTH_TOKEN -> ${a.name} (${tail(a.token)}). NEW terminals start on it; running claude processes keep their old token.`);
   log(`use ${a.name}`);
   return 0;
@@ -1351,18 +1525,36 @@ async function cmdUse(ref) {
 function keepDefault(cur, curUsage, bestHeadroom, now = Date.now()) {
   return !!cur && accountUsable(cur, now) && judge(curUsage) === "ok" && headroom(curUsage) + SWITCH_MARGIN > bestHeadroom;
 }
+// The default account and a fingerprint of the token written for it: re-logging the default account changes its token
+// without changing the account, and the env var must follow.
+const tokenFp = (t) => crypto.createHash("sha256").update(String(t || "")).digest("hex").slice(0, 16);
+function setDefault(a) {
+  if (!setUserEnv(a.token)) return false;
+  withLock((acc, s) => {
+    s.defaultAccountId = a.id;
+    s.defaultTokenFp = tokenFp(a.token);
+  });
+  return true;
+}
+const DEAD_RECHECK_MS = 30 * 60000;
 async function daemonCycle(force) {
   // refresh: re-read every enabled account (paused ones too - a reset may have come early)
   if (force) await Promise.all(loadAccounts().accounts.filter((a) => a.enabled && a.token).map((a) => getUsage(a, { maxAge: 0 })));
+  // "login expired" accounts get another look every 30 min: a server-side blip heals itself, no re-login needed
+  const deadOnes = loadAccounts().accounts.filter((a) => a.enabled && a.token && a.dead && !((peekUsage(a.id) || {}).at > Date.now() - DEAD_RECHECK_MS));
+  await Promise.all(deadOnes.map((a) => getUsage(a, { maxAge: 0 })));
   const p = await pickBest();
   const stamp = new Date().toTimeString().slice(0, 5);
   if (!p) return out(`[pool] ${stamp} no account ready; leaving the default as is`);
   const st = loadState();
-  if (st.defaultAccountId === p.account.id) return;
   const cur = loadAccounts().accounts.find((a) => a.id === st.defaultAccountId);
-  if (keepDefault(cur, cur ? st.usage[cur.id] : null, p.headroom)) return;
-  if (!setUserEnv(p.account.token)) return err(`[pool] ${stamp} could not write the user env var`);
-  withLock((acc, s) => (s.defaultAccountId = p.account.id));
+  const stay = cur && (cur.id === p.account.id || keepDefault(cur, st.usage[cur.id], p.headroom));
+  if (stay) {
+    // same account - but if it was re-logged, new terminals must get the new token
+    if (st.defaultTokenFp !== tokenFp(cur.token) && setDefault(cur)) log(`daemon: default ${cur.name} token refreshed after a re-login`);
+    return;
+  }
+  if (!setDefault(p.account)) return err(`[pool] ${stamp} could not write the user env var`);
   out(`[pool] ${stamp} default -> ${p.account.name} (${leftTxt(p.usage)})`);
   log(`daemon: default -> ${p.account.name}`);
 }
@@ -1459,6 +1651,7 @@ async function cmdDaemon(args = []) {
   };
   try {
     while (!stop && !fs.existsSync(STOP_FLAG)) {
+      try {
       // widget Log in buttons append to login.queue; one login at a time, in order
       const req = !loginBusy && shiftLoginQueue();
       if (req) {
@@ -1512,6 +1705,11 @@ async function cmdDaemon(args = []) {
         nextWidget = Date.now() + 30000;
         if (!widgetPid() && !fs.existsSync(WIDGET_CLOSED)) startWidget();
       }
+      } catch (e) {
+        // one bad pass (a locked file, an unreadable accounts.json) must never end the daemon
+        log(`daemon loop error: ${(e && e.stack) || e}`);
+        await sleep(5000);
+      }
       await sleep(1000);
     }
   } finally {
@@ -1531,17 +1729,24 @@ async function cmdDaemon(args = []) {
 // ---------------------------------------------------------------- install
 // The user PATH (HKCU\Environment\Path) as a list; writing it back also tells running programs, so new terminals see it.
 const samePath = (a, b) => a.replace(/[\\/]+$/, "").toLowerCase() === b.replace(/[\\/]+$/, "").toLowerCase();
+// Read raw (unexpanded) and carried as base64 UTF-8: reg.exe output is in the console code page, which would turn a
+// folder like C:\Users\Jorg into garbage that a later write would make permanent. null = could not read (never write).
 function readUserPath() {
-  try {
-    const r = spawnSync("reg", ["query", "HKCU\\Environment", "/v", "Path"], { encoding: "utf8", windowsHide: true });
-    const m = (r.stdout || "").match(/Path\s+REG_(?:EXPAND_)?SZ\s+(.*)/i);
-    return m ? m[1].trim().split(";").filter(Boolean) : [];
-  } catch {
-    return [];
-  }
+  const r = psRun("$v = (Get-Item 'HKCU:\\Environment').GetValue('Path', $null, 'DoNotExpandEnvironmentNames'); if ($null -eq $v) { 'NONE' } else { 'B64:' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$v)) }");
+  const s = (r.stdout || "").trim();
+  if (r.status !== 0) return null;
+  if (s === "NONE") return [];
+  const m = /^B64:(\S*)$/m.exec(s);
+  return m ? Buffer.from(m[1], "base64").toString("utf8").split(";").filter(Boolean) : null;
 }
 function writeUserPath(parts) {
-  const r = spawnSync("reg", ["add", "HKCU\\Environment", "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", parts.join(";"), "/f"], { stdio: "ignore", windowsHide: true });
+  if (!Array.isArray(parts)) return false;
+  const old = readUserPath();
+  if (old === null) return false;
+  try {
+    fs.appendFileSync(path.join(HOME, "user-path.bak"), `${new Date().toISOString()} ${old.join(";")}\n`); // undo trail
+  } catch {}
+  const r = psRun("$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true); $k.SetValue('Path', $env:CPOOL_PATH, [Microsoft.Win32.RegistryValueKind]::ExpandString); $k.Close()", { CPOOL_PATH: parts.join(";") });
   if (r.status !== 0) return false;
   const ps = "$s=Add-Type -Name W -Namespace P -PassThru -MemberDefinition '[DllImport(\"user32.dll\",SetLastError=true,CharSet=CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr h,uint m,UIntPtr w,string l,uint f,uint t,out UIntPtr r);'; [UIntPtr]$r=[UIntPtr]::Zero; $s::SendMessageTimeout([IntPtr]0xffff,0x1A,[UIntPtr]::Zero,'Environment',2,5000,[ref]$r) | Out-Null";
   spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps], { stdio: "ignore", windowsHide: true });
@@ -1554,13 +1759,24 @@ function cmdInstall() {
   const bin = path.join(HOME, "bin");
   fs.mkdirSync(bin, { recursive: true });
   if (IS_WIN) {
-    const shim = ["@echo off", "setlocal", `set "CP_NODE=node"`, `if exist "${process.execPath}" set "CP_NODE=${process.execPath}"`, `"%CP_NODE%" "%~dp0..\\claude-pool.js" %*`, ""].join("\r\n");
+    // node: the one that ran install, else node.exe from PATH (%%~$PATH:I never looks in the current folder)
+    const shim = [
+      "@echo off",
+      "setlocal",
+      `set "CP_NODE="`,
+      `for %%I in (node.exe) do set "CP_NODE=%%~$PATH:I"`,
+      `if exist "${process.execPath}" set "CP_NODE=${process.execPath}"`,
+      `if not defined CP_NODE (echo cpool: node.exe not found 1>&2 & exit /b 9009)`,
+      `"%CP_NODE%" "%~dp0..\\claude-pool.js" %*`,
+      "",
+    ].join("\r\n");
     for (const n of ["cpool.cmd", "claude-p.cmd"]) fs.writeFileSync(path.join(bin, n), shim);
     out(`[pool] wrote ${path.join(bin, "cpool.cmd")} and claude-p.cmd (both = node claude-pool.js ...; the real \`claude\` is untouched)`);
     if (NO_SYSTEM) out("[pool] (CLAUDE_POOL_NO_SYSTEM) skipped PATH update");
     else {
       const parts = readUserPath();
-      if (parts.some((p) => samePath(p, bin))) out("[pool] bin folder already on the user PATH");
+      if (parts === null) err(`[pool] could not read the user PATH - add this folder yourself: ${bin}`);
+      else if (parts.some((p) => samePath(p, bin))) out("[pool] bin folder already on the user PATH");
       else if (!writeUserPath([...parts, bin])) err(`[pool] could not update the user PATH - add this folder yourself: ${bin}`);
       else out(`[pool] added ${bin} to the user PATH - open a NEW cmd window, then type cpool`);
     }
@@ -1755,7 +1971,7 @@ function screenError(raw) {
 }
 function readLoginQueue() {
   try {
-    return fs.readFileSync(LOGIN_QUEUE, "utf8").replace(/^﻿/, "").split(/\r?\n/).map((l) => {
+    return fs.readFileSync(LOGIN_QUEUE, "utf8").replace(/^\ufeff/, "").split(/\r?\n/).map((l) => {
       const [name, email] = l.split("\t");
       return { name: (name || "").trim(), email: (email || "").trim() };
     }).filter((q) => q.name);
@@ -1763,14 +1979,28 @@ function readLoginQueue() {
     return [];
   }
 }
+// Take the next request without racing the widget's appends: claim the whole file with an atomic rename, keep the
+// first entry, and append the rest back (anything the widget appended meanwhile lands in a fresh login.queue).
 function shiftLoginQueue() {
-  const q = readLoginQueue();
-  if (!q.length) return null;
+  if (!fs.existsSync(LOGIN_QUEUE)) return null;
+  const claim = `${LOGIN_QUEUE}.${process.pid}`;
+  try {
+    fs.renameSync(LOGIN_QUEUE, claim);
+  } catch {
+    return null; // the widget is writing it right now: next second
+  }
+  let q = [];
+  try {
+    q = fs.readFileSync(claim, "utf8").replace(/^\ufeff/, "").split(/\r?\n/).map((l) => {
+      const [name, email] = l.split("\t");
+      return { name: (name || "").trim(), email: (email || "").trim() };
+    }).filter((x) => x.name);
+  } catch {}
   const [first, ...rest] = q;
-  const left = rest.filter((x) => x.name.toLowerCase() !== first.name.toLowerCase());
-  if (left.length) fs.writeFileSync(LOGIN_QUEUE, left.map((x) => `${x.name}\t${x.email}`).join("\r\n") + "\r\n");
-  else takeFlag(LOGIN_QUEUE);
-  return first;
+  const left = first ? rest.filter((x) => x.name.toLowerCase() !== first.name.toLowerCase()) : [];
+  if (left.length) fs.appendFileSync(LOGIN_QUEUE, left.map((x) => `${x.name}\t${x.email}\r\n`).join(""));
+  takeFlag(claim);
+  return first || null;
 }
 let loginChild = null;
 // Runs one login end to end. Resolves to the final status {name, state: done|error|cancelled, message}.
@@ -1892,13 +2122,48 @@ const CLAUDE_SUBCOMMANDS = new Set([
   "purge", "respawn", "rm", "setup-token", "stop", "kill", "ultrareview", "update", "upgrade", "help",
 ]);
 const PASS_FLAGS = new Set(["-p", "--print", "--bg", "-v", "--version", "-h", "--help"]);
-const passThrough = (argv) => (argv.length > 0 && CLAUDE_SUBCOMMANDS.has(argv[0])) || argv.some((a) => PASS_FLAGS.has(a));
+const passThrough = (argv, subcommands = CLAUDE_SUBCOMMANDS) => (argv.length > 0 && subcommands.has(argv[0])) || argv.some((a) => PASS_FLAGS.has(a));
+// The subcommands of the installed claude, from its `--help` (cached per binary size + time, so only re-read after an
+// update): a subcommand added by a future claude still goes straight through instead of becoming a "prompt".
+function claudeSubcommands(bin) {
+  let key;
+  try {
+    const st = fs.statSync(bin);
+    key = `${bin}|${st.size}|${st.mtimeMs}`;
+  } catch {
+    return CLAUDE_SUBCOMMANDS;
+  }
+  const cacheFile = path.join(HOME, "claude-commands.json");
+  const c = readJson(cacheFile, () => null);
+  let cmds = c && c.key === key && Array.isArray(c.cmds) ? c.cmds : null;
+  if (!cmds) {
+    const c = claudeCommand(bin);
+    const r = c.shell
+      ? spawnSync(`"${bin}" --help`, { encoding: "utf8", timeout: 15000, windowsHide: true, shell: true })
+      : spawnSync(c.file, [...c.pre, "--help"], { encoding: "utf8", timeout: 15000, windowsHide: true });
+    const text = r.stdout || "";
+    const i = text.indexOf("Commands:");
+    cmds = [];
+    if (i >= 0) {
+      for (const line of text.slice(i).split(/\r?\n/).slice(1)) {
+        const m = line.match(/^ {2}([a-z][\w-]*)((?:\|[a-z][\w-]*)*)/); // "  update|upgrade   Check for updates..."
+        if (m) cmds.push(m[1], ...m[2].split("|").filter(Boolean));
+      }
+    }
+    if (r.status === 0) {
+      try {
+        writeJsonAtomic(cacheFile, { key, cmds }); // cached even when empty: never re-run --help on every launch
+      } catch {}
+    }
+  }
+  return new Set([...CLAUDE_SUBCOMMANDS, ...cmds]);
+}
 async function cmdShimRun(argv) {
   const ready = loadAccounts().accounts.some((a) => a.enabled && a.token && !a.dead);
-  if (ready && !passThrough(argv)) return cmdRun(argv);
+  if (ready && !passThrough(argv, claudeSubcommands(resolveClaude()))) return cmdRun(argv);
   // not a session, or nothing in the pool yet: be the real claude, untouched
   const bin = resolveClaude();
-  const child = IS_WIN && /\.(cmd|bat)$/i.test(bin) ? spawn([bin, ...argv].map(winQuote).join(" "), { stdio: "inherit", shell: true }) : spawn(bin, argv, { stdio: "inherit" });
+  const child = spawnClaude(bin, argv, { stdio: "inherit" });
   const ignore = () => {}; // Ctrl+C belongs to claude
   process.on("SIGINT", ignore);
   const res = await waitExit(child);
@@ -1917,7 +2182,9 @@ public static class ClaudePoolShim {
     Console.CancelKeyPress += (s, e) => { e.Cancel = true; }; // Ctrl+C belongs to claude, not to this shim
     string dir = Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName);
     string script = Path.GetFullPath(Path.Combine(dir, "..", "claude-pool.js"));
-    var psi = new ProcessStartInfo(File.Exists(NODE) ? NODE : "node", "\"" + script + "\" shim-run " + RawArgs());
+    string node = FindNode();
+    if (node == null) { Console.Error.WriteLine("claude (claude-pool shim): node.exe not found - cpool shim off restores the real claude"); return 9009; }
+    var psi = new ProcessStartInfo(node, "\"" + script + "\" shim-run " + RawArgs());
     psi.UseShellExecute = false;
     try {
       using (var p = Process.Start(psi)) { p.WaitForExit(); return p.ExitCode; }
@@ -1925,6 +2192,16 @@ public static class ClaudePoolShim {
       Console.Error.WriteLine("claude (claude-pool shim): could not start node: " + e.Message + " - cpool shim off restores the real claude");
       return 127;
     }
+  }
+  // the node that ran cpool shim on, else node.exe from PATH (never from the current folder)
+  static string FindNode() {
+    if (File.Exists(NODE)) return NODE;
+    foreach (string d in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';')) {
+      string dir = d.Trim().Trim('"');
+      if (dir.Length == 0) continue;
+      try { string p = Path.Combine(dir, "node.exe"); if (File.Exists(p)) return p; } catch { }
+    }
+    return null;
   }
   // everything after the program name, exactly as typed (no re-quoting)
   static string RawArgs() {
@@ -1966,7 +2243,7 @@ function buildShim() {
 function claudeForNewTerminals() {
   const q = spawnSync("reg", ["query", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/v", "Path"], { encoding: "utf8", windowsHide: true });
   const m = (q.stdout || "").match(/Path\s+REG_(?:EXPAND_)?SZ\s+(.*)/i);
-  const dirs = [...(m ? m[1].trim().split(";") : []), ...readUserPath()].filter(Boolean).map((d) => d.replace(/%([^%]+)%/g, (x, v) => process.env[v] || x));
+  const dirs = [...(m ? m[1].trim().split(";") : []), ...(readUserPath() || [])].filter(Boolean).map((d) => d.replace(/%([^%]+)%/g, (x, v) => process.env[v] || x));
   for (const d of dirs) for (const ext of [".exe", ".cmd", ".bat"]) if (fs.existsSync(path.join(d, "claude" + ext))) return path.join(d, "claude" + ext);
   return null;
 }
@@ -1983,7 +2260,10 @@ function cmdShim(sub) {
       return err(`[pool] ${e.message}`), 1;
     }
     if (NO_SYSTEM) out("[pool] (CLAUDE_POOL_NO_SYSTEM) skipped the PATH change");
-    else if (!writeUserPath([bin, ...readUserPath().filter((p) => !samePath(p, bin))])) return err("[pool] could not update the user PATH"), 1;
+    else {
+      const cur = readUserPath();
+      if (cur === null || !writeUserPath([bin, ...cur.filter((p) => !samePath(p, bin))])) return err("[pool] could not read or update the user PATH - nothing changed"), 1;
+    }
     out("[pool] claude now starts through the pool in NEW terminals: sessions switch accounts when one hits its limit.");
     out(`[pool] claude update / mcp / -p / --bg / --version ... go straight to the real claude (${resolveClaude()}). The VS Code panel is not affected.`);
     out("[pool] undo: cpool shim off");
@@ -2016,17 +2296,35 @@ function imageName(pid) {
   const m = (r.stdout || "").match(/^"([^"]+)","(\d+)"/m);
   return m && Number(m[2]) === pid ? m[1].toLowerCase() : "";
 }
+// Only our widget counts: a pid file left over from before a reboot is ignored, and the process must really be
+// powershell running our widget.ps1 - a reused pid (the user's own PowerShell window) is never stopped or trusted.
 function widgetPid() {
   let pid = 0;
   try {
+    if (fs.statSync(WIDGET_PID).mtimeMs < Date.now() - os.uptime() * 1000) return 0; // written before this boot
     pid = Number(fs.readFileSync(WIDGET_PID, "utf8").trim());
   } catch {}
-  return pid && imageName(pid) === "powershell.exe" ? pid : 0;
+  if (!pid || imageName(pid) !== "powershell.exe") return 0;
+  const cmd = processCommandLine(pid);
+  return cmd.toLowerCase().includes(WIDGET_PS1.toLowerCase()) ? pid : 0;
+}
+function processCommandLine(pid) {
+  if (!IS_WIN) return "";
+  const r = psRun("[string](Get-CimInstance Win32_Process -Filter ('ProcessId=' + $env:CPOOL_PID)).CommandLine", { CPOOL_PID: String(pid) });
+  return (r.stdout || "").trim();
 }
 // A .vbs run by wscript starts a console program with a new, hidden console: no window flash, and it does not die
 // with the terminal it was launched from. (powershell.exe spawned DETACHED exits without running the script.)
-function writeVbs(file, commandLine, what) {
-  const vbs = [`' claude-pool: ${what}. Written by claude-pool.js.`, `CreateObject("WScript.Shell").Run "${commandLine.replace(/"/g, '""')}", 0, False`, ""].join("\r\n");
+// nodePath: the command line starts with node; if that exact node.exe is gone (a node upgrade moved it), fall back to
+// node from PATH instead of failing silently (wscript //B shows no errors).
+function writeVbs(file, commandLine, what, nodePath = null) {
+  const q = (s) => s.replace(/"/g, '""');
+  const lines = [`' claude-pool: ${what}. Written by claude-pool.js.`];
+  if (nodePath) {
+    lines.push('Set fso = CreateObject("Scripting.FileSystemObject")', `node = "${q(nodePath)}"`, 'If Not fso.FileExists(node) Then node = "node.exe"');
+    lines.push(`CreateObject("WScript.Shell").Run """" & node & """ ${q(commandLine)}", 0, False`);
+  } else lines.push(`CreateObject("WScript.Shell").Run "${q(commandLine)}", 0, False`);
+  const vbs = [...lines, ""].join("\r\n");
   fs.writeFileSync(file, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(vbs, "utf16le")])); // UTF-16 BOM: any user-folder name
 }
 const runVbs = (file) => spawn("wscript.exe", ["//B", "//Nologo", file], { detached: true, stdio: "ignore", windowsHide: true }).unref();
@@ -2034,7 +2332,7 @@ const runVbs = (file) => spawn("wscript.exe", ["//B", "//Nologo", file], { detac
 function startWidget() {
   if (!IS_WIN) return false;
   ensureHome();
-  fs.writeFileSync(WIDGET_PS1, "﻿" + WIDGET_SCRIPT.replace(/\r?\n/g, "\r\n")); // BOM: PowerShell 5.1 reads BOM-less files as ANSI
+  fs.writeFileSync(WIDGET_PS1, "\ufeff" + WIDGET_SCRIPT.replace(/\r?\n/g, "\r\n")); // BOM: PowerShell 5.1 reads BOM-less files as ANSI
   const vbs = path.join(HOME, "widget.vbs");
   writeVbs(vbs, `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "${WIDGET_PS1}" -StateDir "${HOME}"`, "desktop widget, no window");
   if (NO_SYSTEM) return false;
@@ -2054,21 +2352,55 @@ async function stopDaemon() {
   fs.writeFileSync(STOP_FLAG, "");
   for (let i = 0; i < 80 && pidAlive(pid); i++) await sleep(100); // it checks the flag every second
   if (pidAlive(pid) && imageName(pid) === path.basename(process.execPath).toLowerCase()) {
-    spawnSync("taskkill", ["/PID", String(pid), "/F"], { stdio: "ignore", windowsHide: true });
+    spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore", windowsHide: true }); // with its login helper
   }
   takeFlag(STOP_FLAG);
   return pid;
 }
+// PowerShell with the script base64-encoded: no quoting trouble on the command line
+function psRun(script, env = {}) {
+  const enc = Buffer.from(script, "utf16le").toString("base64");
+  return spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc], {
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
+// A Task Scheduler "at log on" task starts within seconds of sign-in. HKCU\Run entries wait their turn behind every
+// other startup app, one at a time with ~30 s waits (minutes on a busy PC). Both stay registered: whichever starts
+// first runs the daemon, the second sees it running and exits.
+const TASK_NAME = "claude-pool";
+function registerLogonTask() {
+  const r = psRun(
+    [
+      "$ErrorActionPreference = 'Stop'",
+      "$me = $env:USERDOMAIN + '\\' + $env:USERNAME",
+      "$a = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('//B //Nologo \"' + $env:CPOOL_VBS + '\"')",
+      "$t = New-ScheduledTaskTrigger -AtLogOn -User $me",
+      // watchdog: every 10 minutes; a running daemon makes the extra start exit at once, a crashed one comes back
+      "$w = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10) -RepetitionInterval (New-TimeSpan -Minutes 10)",
+      "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable",
+      "$p = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited",
+      "Register-ScheduledTask -TaskName $env:CPOOL_TASK -Action $a -Trigger @($t, $w) -Settings $s -Principal $p -Description 'claude-pool daemon + desktop widget (cpool background on); repeats every 10 min as a watchdog' -Force | Out-Null",
+    ].join("\n"),
+    { CPOOL_VBS: BG_VBS, CPOOL_TASK: TASK_NAME }
+  );
+  return r.status === 0 ? null : (r.stderr || r.stdout || "failed").trim().split(/\r?\n/)[0].slice(0, 160);
+}
+const unregisterLogonTask = () => psRun("Unregister-ScheduledTask -TaskName $env:CPOOL_TASK -Confirm:$false -ErrorAction SilentlyContinue", { CPOOL_TASK: TASK_NAME });
+const logonTaskExists = () => /yes/.test(psRun("if (Get-ScheduledTask -TaskName $env:CPOOL_TASK -ErrorAction SilentlyContinue) { 'yes' }", { CPOOL_TASK: TASK_NAME }).stdout || "");
 async function bgOn() {
   ensureHome();
   const script = path.join(HOME, "claude-pool.js");
   if (path.resolve(__filename).toLowerCase() !== script.toLowerCase()) fs.copyFileSync(__filename, script);
-  writeVbs(BG_VBS, `"${process.execPath}" "${script}" daemon ${BG_MINUTES} --widget`, "pool daemon + desktop widget, no window (cpool background on)");
+  writeVbs(BG_VBS, `"${script}" daemon ${BG_MINUTES} --widget`, "pool daemon + desktop widget, no window (cpool background on)", process.execPath);
   const runCmd = `wscript.exe //B //Nologo "${BG_VBS}"`;
   if (NO_SYSTEM) out("[pool] (CLAUDE_POOL_NO_SYSTEM) skipped the logon entry and launch");
   else {
     const r = spawnSync("reg", ["add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", runCmd, "/f"], { stdio: "ignore", windowsHide: true });
     if (r.status !== 0) return err("[pool] could not write the logon entry (HKCU Run)"), 1;
+    const terr = registerLogonTask();
+    if (terr) err(`[pool] logon task not created (${terr}) - the startup entry still works, it just starts later after sign-in`);
   }
   // restart both so the running copies are this version
   const old = await stopDaemon();
@@ -2085,7 +2417,10 @@ async function bgOn() {
   return 0;
 }
 async function bgOff() {
-  if (!NO_SYSTEM) spawnSync("reg", ["delete", RUN_KEY, "/v", RUN_VALUE, "/f"], { stdio: "ignore", windowsHide: true });
+  if (!NO_SYSTEM) {
+    spawnSync("reg", ["delete", RUN_KEY, "/v", RUN_VALUE, "/f"], { stdio: "ignore", windowsHide: true });
+    unregisterLogonTask();
+  }
   const d = await stopDaemon();
   const w = stopWidget();
   out(`[pool] background off: logon entry removed${d ? `, daemon (pid ${d}) stopped` : ""}${w ? ", widget closed" : ""}.`);
@@ -2101,7 +2436,8 @@ function bgStatus() {
   const st = loadState();
   const def = loadAccounts().accounts.find((a) => a.id === st.defaultAccountId);
   const age = snap && snap.generatedAt ? fmtLeft(Date.now() - snap.generatedAt) : "never";
-  out(`logon     ${onLogon ? "on (starts hidden at every logon)" : "off - cpool background on"}`);
+  const task = !NO_SYSTEM && logonTaskExists();
+  out(`logon     ${onLogon || task ? `on - ${task ? "logon task (starts at sign-in)" : "no logon task"}${onLogon ? " + startup entry" : ""}` : "off - cpool background on"}`);
   out(`daemon    ${d ? `running, pid ${d}, checks every ${snap.daemon.everyMs / 60000} min` : `not running (last snapshot ${age} ago)`}`);
   out(`widget    ${w ? `running, pid ${w}` : fs.existsSync(WIDGET_CLOSED) ? "closed - cpool widget shows it" : "not running"}`);
   out(`default   ${def ? def.name : "none"} (CLAUDE_CODE_OAUTH_TOKEN for new terminals)`);
@@ -2144,7 +2480,14 @@ $RefreshFlag = Join-Path $StateDir 'refresh.flag'
 $LoginQueue = Join-Path $StateDir 'login.queue'
 $LoginCancel = Join-Path $StateDir 'login.cancel'
 $LogFile = Join-Path $StateDir 'widget.log'
-function Write-Log([string]$m) { try { Add-Content -Path $LogFile -Value ((Get-Date -Format s) + ' ' + $m) -Encoding UTF8 } catch {} }
+# widget.log: rotated at 1 MB; the same message at most once a minute (Tick runs every 2 s)
+try { if ((Test-Path $LogFile) -and (Get-Item $LogFile).Length -gt 1MB) { Move-Item $LogFile ($LogFile + '.1') -Force } } catch {}
+$script:LastLogMsg = ''; $script:LastLogAt = [datetime]::MinValue
+function Write-Log([string]$m) {
+  if ($m -eq $script:LastLogMsg -and ((Get-Date) - $script:LastLogAt).TotalSeconds -lt 60) { return }
+  $script:LastLogMsg = $m; $script:LastLogAt = Get-Date
+  try { Add-Content -Path $LogFile -Value ((Get-Date -Format s) + ' ' + $m) -Encoding UTF8 } catch {}
+}
 
 # one widget per pool folder
 $created = $false
@@ -2613,6 +2956,8 @@ module.exports = {
   withLock, loadAccounts, loadState, probeToken, getUsage, pickBest, judge, headroom, parseLimitWaitMs, parseRunArgs, buildArgs, redact, HOME,
   fmtShort, buildSnapshot, summaryLines, keepDefault, startWidget, WIDGET_SCRIPT, SNAPSHOT_FILE, SWITCH_MARGIN,
   tokenFromScreen, ensureHelper, readLoginQueue, dueHis, matchCliAccount, fetchCliUsage, passThrough, chooseClaude, buildShim,
+  childSession, transcriptExists, claudeSubcommands, findLatestSession, pauseUntilFor, findAccount, acquireLock,
+  shiftLoginQueue, claudeCommand, widgetPid, daemonCycle, LOGIN_QUEUE, WIDGET_PID, ACCOUNTS_FILE, STATE_FILE,
 };
 
 if (require.main === module) {

@@ -218,8 +218,10 @@ and the daemon runs.
    `--session-id` so they can be resumed.
 3. **Monitor**: every 90 s it reads the account's limits (cached and shared between all `cpool` windows for 60 s).
 4. **Swap**: when the account is out (5h or 7d at 99 % or more, or a 429), the account is paused until its reset.
-   The claude process tree is killed and `claude --resume <same id> "continue where you left off"` starts on the next
-   account. If claude exits with an error on its own (for example *Failed to authenticate*), the account is
+   The claude process tree is killed and `claude --resume <id> "continue where you left off"` starts on the next
+   account. The id is the conversation claude is on *at that moment*, read from Claude Code's per-process registry
+   (`~/.claude/sessions/<pid>.json`), so it follows `/resume` and `/clear` inside claude, including conversations
+   saved under another project folder. If that conversation was never saved, a fresh session starts instead. If claude exits with an error on its own (for example *Failed to authenticate*), the account is
    re-checked and the session swaps instead of dying.
 5. **All out**: it prints the soonest reset, counts down and resumes by itself. More than 20 swaps in 10 minutes
    stops it, as a safety net.
@@ -238,6 +240,16 @@ Wrapper flags (never passed to claude): `--pool-account <name>`, `--pool-poll <s
   widget if it dies.
 - Only one daemon runs per pool folder. Changes made with `add`, `remove`, `on`, `off` or `reset` trigger an
   immediate re-check.
+
+How it starts with Windows: `background on` registers two things, both running `wscript background.vbs` (no window).
+- A **Task Scheduler** task named `claude-pool`, triggered when you sign in. It starts within seconds, and no admin
+  rights are needed. It also repeats every 10 minutes as a watchdog: a running daemon makes the extra start exit
+  at once, and a crashed one is back within 10 minutes.
+- A **startup entry** under `HKCU\...\Run` as a backup. Windows runs those one at a time, waiting up to about 30 s for
+  each app before it, so on a busy PC it can be minutes after sign-in before this one runs.
+
+Whichever starts first runs the daemon; the other sees it running and exits. `cpool background` shows both, and
+`background off` removes both.
 
 `cpool use [name|best|off]` sets or removes that default by hand. Only **new** terminals pick it up; a running plain
 `claude` keeps the token it started with. Use `cpool` for live swaps.
@@ -276,6 +288,7 @@ Wrapper flags (never passed to claude): `--pool-account <name>`, `--pool-poll <s
 | `CLAUDE_POOL_AUTO_HI` | `1` | `0` = no auto hi |
 | `CLAUDE_POOL_LOGIN_BROWSER` | `private` | `normal` window, or `none` (print the URL only) |
 | `CLAUDE_POOL_PROBE_URL` | `https://api.anthropic.com` | API base (tests point it at a mock) |
+| `CLAUDE_POOL_PROBE_MODEL` | `claude-haiku-5-5` | Model for the 1-token limit probe; if it is retired (404), the probe falls back to the next known Haiku |
 | `CLAUDE_POOL_NO_SYSTEM` | unset | `1` = never touch registry, ACLs, PATH, or start processes (tests) |
 
 ## Files, tokens and security
@@ -291,13 +304,23 @@ Everything lives in `~/.claude-pool` (`%USERPROFILE%\.claude-pool`):
 | `cli-usage.json` | 5h / 7d usage of the `claude /login` account (for the Logins line; no token) |
 | `widget.ps1`, `widget.vbs`, `background.vbs`, `widget-prefs.json` | Widget script (rewritten on start), hidden launchers, position / background |
 | `cpool-helper-*.exe` / `.cs` | The login helper and its source |
-| `pool.log`, `widget.log` | Logs (tokens redacted) |
+| `pool.log`, `widget.log` | Logs (tokens redacted), rotated at 2 MB / 1 MB with one previous file kept |
+| `claude-commands.json` | claude's subcommand list read from `claude --help` (re-read only when claude changes) |
 
 - On Windows the folder ACL is reduced to your user when it is created (`icacls /inheritance:r`); on macOS / Linux it
   is `0700`.
 - Every line claude-pool prints or logs passes through a redactor that shortens any `sk-ant-...` token to its last 4
   characters. The tests check that no token reaches stdout, stderr, logs or the widget data.
 - Tokens are only sent to `api.anthropic.com` (limit probes) and passed to `claude` in its environment.
+- The **default account** (`cpool use`, the daemon) is written to the user env var `CLAUDE_CODE_OAUTH_TOKEN`, so
+  every program you start can read that one token. That is how plain `claude` picks it up. If you don't want it,
+  `cpool use off`, and start Claude through `cpool` / the shim instead.
+- Prefer `cpool add <name>` (hidden prompt) or the widget's Log in over `cpool add <name> <token>`: a token typed on the
+  command line lands in your shell history.
+- `accounts.json` is never overwritten after a failed read: if it can't be parsed, cpool stops with an error. A copy
+  of the last good version is kept as `accounts.json.bak`.
+- claude is only ever started from PATH, never from the current folder, and never through cmd.exe with your
+  arguments (npm's `claude.cmd` is run as `node <cli.js>`).
 - For the Logins line the daemon reads the access token of your `claude /login` from `~/.claude/.credentials.json`,
   read-only and every 5 minutes. It calls Anthropic's usage endpoint with it (the same call `/usage` makes, which
   spends no tokens). It never refreshes, stores or prints that token, and skips the call when the token has expired.
@@ -360,6 +383,7 @@ Only if the daemon or `cpool use` sets the user env var `CLAUDE_CODE_OAUTH_TOKEN
 
 ```bat
 cpool background off
+cpool shim off
 cpool use off
 ```
 
