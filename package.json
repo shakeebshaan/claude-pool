@@ -1,0 +1,52 @@
+{
+  "name": "claude-pool",
+  "version": "1.2.0",
+  "description": "Pool several Claude subscriptions for Claude Code: auto-switch accounts on 5-hour / weekly usage limits and resume the same session, desktop widget with every account's limits, one-click login, auto hi at every 5h reset. One file, zero dependencies.",
+  "main": "claude-pool.js",
+  "bin": {
+    "cpool": "claude-pool.js",
+    "claude-pool": "claude-pool.js"
+  },
+  "scripts": {
+    "test": "node --test test/widget.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "claude-pool.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "claude-max",
+    "claude-pro",
+    "usage-limit",
+    "rate-limit",
+    "5-hour-limit",
+    "weekly-limit",
+    "multi-account",
+    "account-switcher",
+    "account-pool",
+    "session-resume",
+    "setup-token",
+    "claude-code-oauth-token",
+    "desktop-widget",
+    "usage-monitor",
+    "windows",
+    "cli",
+    "ai-agents"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shakeebshaan/claude-pool.git"
+  },
+  "homepage": "https://shakeebshaan.github.io/claude-pool/",
+  "bugs": {
+    "url": "https://github.com/shakeebshaan/claude-pool/issues"
+  }
+}

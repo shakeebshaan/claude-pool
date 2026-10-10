@@ -1,0 +1,23 @@
+# claude-pool
+
+> claude-pool is a single-file, zero-dependency Node.js (18+) tool that pools several Claude subscriptions (Pro / Max) for Claude Code. When the account a session runs on hits its 5-hour or weekly usage limit, it switches to the account with the most headroom and resumes the same conversation with `claude --resume <id>`. On Windows it adds a transparent desktop widget with every account's limits, one-click login buttons (private browser window, token captured automatically), a background daemon that starts with Windows, and "auto hi": a 1-token message right after each 5h reset so the next window starts at once.
+
+Use it when Claude Code keeps stopping with "usage limit reached" and you have more than one Claude subscription, when you want to see all accounts' 5h / 7d limits at a glance, or when you want new terminals to start on whichever account still has capacity.
+
+## Docs
+
+- [README](https://github.com/shakeebshaan/claude-pool/blob/main/README.md): install, widget, one-click login, auto hi, live switching, commands, configuration, security, FAQ
+- [Source](https://github.com/shakeebshaan/claude-pool/blob/main/claude-pool.js): the whole tool in one file; `node claude-pool.js help` prints the usage
+- [Tests](https://github.com/shakeebshaan/claude-pool/blob/main/test/widget.test.js): `node --test test/widget.test.js`
+- [Agent notes](https://github.com/shakeebshaan/claude-pool/blob/main/AGENTS.md): how to work on the code
+
+## Quick facts
+
+- Install: `node claude-pool.js install` (writes the `cpool` command), then `cpool background on` on Windows
+- Run Claude Code with live account switching: `cpool [any claude arguments]`
+- See all limits: `cpool limits`
+- Add an account: widget "Log in" / "+ Add account", or `cpool login <name>`, or `claude setup-token` + `cpool add <name>`
+- Limits are read from the `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}` headers of a 1-token Haiku request
+- Tokens live in `~/.claude-pool/accounts.json` (owner-only), are never printed, and never appear in the widget data
+- Each account keeps its own limits; claude-pool only chooses which of your accounts to use
+- License: MIT

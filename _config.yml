@@ -1,0 +1,13 @@
+# GitHub Pages: renders README.md as the project site (search engines index it; llms.txt is served at the root)
+title: claude-pool
+description: Pool several Claude subscriptions for Claude Code - auto-switch accounts on 5-hour and weekly usage limits, resume the same session, desktop widget, one-click login, auto hi at every 5h reset.
+theme: jekyll-theme-cayman
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+include:
+  - llms.txt
+exclude:
+  - test
+  - package.json
+  - claude-pool.js

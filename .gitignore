@@ -1,0 +1,23 @@
+# never commit a pool folder, tokens or logs
+.claude-pool/
+accounts.json
+state.json
+snapshot.json
+login.json
+login.queue
+autohi.json
+widget-prefs.json
+*.log
+*.url
+cpool-helper-*.exe
+cpool-helper-*.cs
+.env
+.env.*
+
+# local tooling
+node_modules/
+.claude/
+humanpending.md
+*.tmp
+Thumbs.db
+.DS_Store
