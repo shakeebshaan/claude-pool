@@ -48,7 +48,7 @@ COMMANDS
   cpool background [on|off]        Windows: run the daemon (every 2 min) + the desktop widget hidden, now and at
                                    every logon (HKCU Run -> wscript background.vbs). No argument = status.
   cpool widget [stop]              show / close the transparent desktop widget (drag to move, right-click for
-                                   refresh, add account, auto hi, background, lock position, close)
+                                   refresh, add account, re-login account, auto hi, background, lock position, close)
   cpool autohi [on|off]            auto hi (default on, part of the daemon): the moment an account's 5h window
                                    resets, send it a 1-token "hi" so the next window starts at once - 24/7 while
                                    the PC is awake. CLAUDE_POOL_AUTO_HI=0 also turns it off.
@@ -940,7 +940,13 @@ async function cmdLimits() {
   out("");
   out(best ? `next session starts on: ${best.account.name} (usable ${Math.round(best.headroom)}% = min of 5h/7d left)` : "no account is ready right now");
   out("");
-  for (const l of summaryLines(buildSnapshot(loadAccounts(), liveState(loadState())))) out(l);
+  let cli = cliInfo();
+  if (cli && !cli.usage) {
+    const v = await fetchCliUsage(); // no daemon (or stale): read it now
+    if (v && !v.error && v.email === cli.email) cli = { ...cli, usage: { session: v.session, weekly: v.weekly } };
+  }
+  const snap = buildSnapshot(loadAccounts(), liveState(loadState()), Date.now(), null, [], { on: autoHiOn(), last: readJson(AUTO_HI_LAST, () => null) }, cli);
+  for (const l of summaryLines(snap)) out(l);
   return 0;
 }
 
@@ -956,7 +962,9 @@ function rowStatus(a, u, now, sessions, active) {
   if (!a.token) return { text: "needs login", kind: "login" };
   if (a.dead) return { text: "login expired", kind: "dead" };
   if (a.pausedUntil > now) return { text: `paused to ${fmtClock(a.pausedUntil, now)}`, kind: "paused" };
-  if (active) return { text: sessions > 1 ? `in use (${sessions})` : "in use", kind: "active" };
+  // in use = a live cpool session runs on it; new terminals = the daemon's default (CLAUDE_CODE_OAUTH_TOKEN), which
+  // only processes started after it was set pick up - an IDE opened earlier keeps its own claude /login
+  if (active) return { text: sessions > 1 ? `in use (${sessions})` : sessions ? "in use" : "new terminals", kind: "active" };
   if (!hasData(u)) return { text: u && u.error ? "no data" : "checking", kind: "unknown" };
   return { text: "ready", kind: "ready" };
 }
@@ -982,7 +990,8 @@ function resetLine(pool, usage, key, now) {
 // login = { name, state, message, at } of the current / last widget login, queue = names waiting for their turn.
 const LOGIN_BUSY = { starting: "opening browser...", browser: "finish in browser...", saving: "saving..." };
 // hi = { on, last: { name, at } } of auto hi. Until some account is logged in, the summary lines say what will appear.
-function buildSnapshot(accDoc, state, now = Date.now(), login = null, queue = [], hi = { on: true, last: null }) {
+// cli = { email, org } of `claude /login` (~/.claude.json): what claude uses when CLAUDE_CODE_OAUTH_TOKEN is not set.
+function buildSnapshot(accDoc, state, now = Date.now(), login = null, queue = [], hi = { on: true, last: null }, cli = null) {
   const sessions = liveSessionsByAccount(state);
   const pool = accDoc.accounts.filter((a) => a.enabled);
   const rows = accDoc.accounts.map((a) => {
@@ -1015,6 +1024,15 @@ function buildSnapshot(accDoc, state, now = Date.now(), login = null, queue = []
   const loggedIn = pool.filter((a) => a.token && !a.dead).length;
   const waiting = pool.length > 0 && loggedIn === 0; // placeholder text until the first login
   const hiText = !hi.on ? "off - cpool autohi on" : waiting ? "on - starts after you log in" : hi.last ? `on · last ${hi.last.name} at ${fmtClock(hi.last.at, now)}` : "on · sends hi at every 5h reset";
+  const def = accDoc.accounts.find((a) => a.id === state.defaultAccountId && a.enabled && a.token);
+  const cliEmail = cli && cli.email ? String(cli.email) : "";
+  // which pool account IS the /login account: an email you gave it, else its usage windows (never a name guess)
+  const byEmail = cliEmail && accDoc.accounts.find((a) => a.email && a.email.toLowerCase() === cliEmail.toLowerCase());
+  const cliAcct = byEmail || (cli && matchCliAccount(accDoc, state.usage, cli.usage));
+  // matched by usage under a name that is not the mailbox: show the real email so crossed names are visible
+  const crossed = cliAcct && !byEmail && cliAcct.name.toLowerCase() !== cliEmail.split("@")[0].toLowerCase();
+  const cliText = !cliAcct ? cliEmail : crossed ? `${cliAcct.name} (${cliEmail})` : cliAcct.name;
+  const loginsText = `new terminals → ${def ? def.name : "their own claude /login"}` + (cliEmail ? ` · claude /login → ${cliText}` : "");
   return {
     version: 1,
     generatedAt: now,
@@ -1034,6 +1052,7 @@ function buildSnapshot(accDoc, state, now = Date.now(), login = null, queue = []
       ? { h5: "after login", d7: "after login" }
       : { h5: resetLine(pool, state.usage, "session", now), d7: resetLine(pool, state.usage, "weekly", now) },
     autoHi: { on: !!hi.on, text: hiText },
+    logins: { text: loginsText, cli: cliAcct ? cliAcct.name : cliEmail || null },
     needLogin: rows.filter((r) => r.kind === "login" || r.kind === "dead").length,
     login: login ? { name: login.name, state: login.state, message: login.message || "", at: login.at } : null,
   };
@@ -1045,7 +1064,74 @@ function summaryLines(snap) {
     `5h resets  ${snap.resets.h5}`,
     `7d resets  ${snap.resets.d7}`,
     `Auto hi    ${snap.autoHi.text}`,
+    `Logins     ${snap.logins.text}`,
   ];
+}
+// Pure. The pool account that is the same Claude account as `claude /login`: its weekly window (and 5h window when
+// both have one) must agree - reset within 2 minutes, use within 10 points - and only one account may match.
+// Reset times alone can coincide between accounts, so no match / several matches = null, never a guess.
+function matchCliAccount(accDoc, usage, cliUsage) {
+  if (!cliUsage || !cliUsage.weekly || !cliUsage.weekly.resetsAt) return null;
+  const near = (a, b, tol) => a != null && b != null && Math.abs(a - b) <= tol;
+  const same = (w, v) => near(w.resetsAt, v.resetsAt, 120000) && near(w.used, v.used, 10);
+  const hits = accDoc.accounts.filter((a) => {
+    const u = a.token && usage[a.id];
+    if (!u || !u.weekly || !same(cliUsage.weekly, u.weekly)) return false;
+    return !cliUsage.session || !u.session || !cliUsage.session.resetsAt || same(cliUsage.session, u.session);
+  });
+  return hits.length === 1 ? hits[0] : null;
+}
+// Usage of the `claude /login` account from the official /api/oauth/usage endpoint (what /usage shows; spends no
+// tokens). Reads the access token Claude Code keeps in ~/.claude/.credentials.json, read-only: never refreshed, never
+// stored or printed, skipped when expired or missing (macOS keeps it in the Keychain).
+const CLI_USAGE_FILE = path.join(HOME, "cli-usage.json");
+const CLI_USAGE_EVERY_MS = 5 * 60000;
+async function fetchCliUsage() {
+  const dir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+  let cred;
+  try {
+    cred = JSON.parse(fs.readFileSync(path.join(dir, ".credentials.json"), "utf8")).claudeAiOauth || {};
+  } catch {
+    return null;
+  }
+  if (!cred.accessToken || (cred.expiresAt && cred.expiresAt < Date.now() + 60000)) return null;
+  const login = readClaudeLogin();
+  const base = { at: Date.now(), email: login ? login.email : null };
+  try {
+    const r = await fetch(`${API}/api/oauth/usage`, {
+      headers: { Authorization: `Bearer ${cred.accessToken}`, "anthropic-beta": "oauth-2025-04-20", "User-Agent": UA },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!r.ok) return { ...base, error: `HTTP ${r.status}` };
+    const j = await r.json();
+    const w = (x) => (x && x.utilization != null ? { used: Number(x.utilization), resetsAt: x.resets_at ? Date.parse(x.resets_at) : null } : null);
+    return { ...base, session: w(j.five_hour), weekly: w(j.seven_day) };
+  } catch (e) {
+    return { ...base, error: String((e && e.message) || e).slice(0, 100) };
+  }
+}
+// /login account + its latest usage reading (when it is for the same email and under 15 minutes old)
+function cliInfo() {
+  const login = readClaudeLogin();
+  if (!login) return null;
+  const u = readJson(CLI_USAGE_FILE, () => null);
+  const fresh = u && !u.error && u.email === login.email && Date.now() - u.at < 15 * 60000;
+  return { ...login, usage: fresh ? { session: u.session, weekly: u.weekly } : null };
+}
+// The account `claude /login` is signed in to (shown by /status). Cached by file time; ~/.claude.json can be large.
+let cliCache = { mtime: 0, value: null };
+function readClaudeLogin() {
+  try {
+    const f = process.env.CLAUDE_CONFIG_DIR ? path.join(process.env.CLAUDE_CONFIG_DIR, ".claude.json") : path.join(os.homedir(), ".claude.json");
+    const m = fs.statSync(f).mtimeMs;
+    if (m !== cliCache.mtime) {
+      const oa = JSON.parse(fs.readFileSync(f, "utf8")).oauthAccount || {};
+      cliCache = { mtime: m, value: oa.emailAddress ? { email: oa.emailAddress, org: oa.organizationName || "" } : null };
+    }
+    return cliCache.value;
+  } catch {
+    return null;
+  }
 }
 // state with sessions of dead processes dropped (loadState does not prune; withLock does)
 function liveState(st) {
@@ -1057,7 +1143,7 @@ function writeSnapshot(daemon) {
   const snap = buildSnapshot(loadAccounts(), liveState(loadState()), Date.now(), readJson(LOGIN_STATUS, () => null), readLoginQueue().map((q) => q.name), {
     on: autoHiOn(),
     last: readJson(AUTO_HI_LAST, () => null),
-  });
+  }, cliInfo());
   snap.daemon = daemon || null;
   writeJsonAtomic(SNAPSHOT_FILE, snap);
   return snap;
@@ -1353,7 +1439,7 @@ async function cmdDaemon(args = []) {
       log(`snapshot error: ${e.message}`);
     }
   }, SNAPSHOT_EVERY_MS);
-  let sig = null, nextProbe = 0, nextWidget = 0, loginBusy = false;
+  let sig = null, nextProbe = 0, nextWidget = 0, loginBusy = false, nextCli = 0;
   const hiDone = {}, hiBusy = new Set();
   const snapNow = () => {
     try {
@@ -1402,6 +1488,16 @@ async function cmdDaemon(args = []) {
         } catch (e) {
           log(`snapshot error: ${e.message}`);
         }
+      }
+      if (Date.now() >= nextCli) {
+        nextCli = Date.now() + CLI_USAGE_EVERY_MS; // which pool account the claude /login session is on
+        fetchCliUsage()
+          .then((v) => {
+            if (v && /HTTP 429/.test(v.error || "")) nextCli = Date.now() + 30 * 60000;
+            if (v) writeJsonAtomic(CLI_USAGE_FILE, v);
+            snapNow();
+          })
+          .catch((e) => log(`cli usage error: ${e.message}`));
       }
       if (withWidget && Date.now() >= nextWidget) {
         nextWidget = Date.now() + 30000;
@@ -2120,13 +2216,15 @@ function Render {
       $i++
     }
     $Summary.Visibility = 'Visible'
-    Reset-Rows $Summary 4
+    Reset-Rows $Summary 5
     Add-Text $Summary 0 0 'Usable' $Muted
     Add-Text $Summary 1 0 '5h resets' $Muted
     Add-Text $Summary 2 0 '7d resets' $Muted
     Add-Text $Summary 3 0 'Auto hi' $Muted
     $hiText = if ($snap.autoHi) { [string]$snap.autoHi.text } else { '-' }
     Add-Text $Summary 3 1 $hiText $(if ($snap.autoHi -and $snap.autoHi.on) { $Fg } else { $Muted }) 12
+    Add-Text $Summary 4 0 'Logins' $Muted
+    Add-Text $Summary 4 1 $(if ($snap.logins) { [string]$snap.logins.text } else { '-' }) $Fg 12
     $u = $snap.usable
     $bar = New-Object Windows.Controls.StackPanel
     $bar.Orientation = 'Horizontal'
@@ -2245,11 +2343,24 @@ function Add-MenuItem([string]$header, [scriptblock]$onClick) {
 }
 [void](Add-MenuItem 'Refresh now' { try { Set-Content -Path $RefreshFlag -Value '' } catch {} })
 [void](Add-MenuItem 'Add account...' { Add-Account })
+# Re-login: replace any account's login (wrong account signed in, token revoked, ...) - same flow as Log in
+$script:ReloginItem = Add-MenuItem 'Re-login account' {}
+function Fill-ReloginMenu {
+  $script:ReloginItem.Items.Clear()
+  $names = @($script:Snap.rows | Where-Object { $_ } | ForEach-Object { [string]$_.name })
+  foreach ($n in $names) {
+    $mi = New-Object Windows.Controls.MenuItem
+    $mi.Header = $n.Replace('_', '__'); $mi.Tag = $n   # double _ : no access-key underline
+    $mi.Add_Click({ param($s, $e) Request-Login @([string]$s.Tag) })
+    [void]$script:ReloginItem.Items.Add($mi)
+  }
+  $script:ReloginItem.IsEnabled = $names.Count -gt 0
+}
 $AutoHiOff = Join-Path $StateDir 'autohi.off'
 $script:HiItem = Add-MenuItem 'Auto hi at every 5h reset' {
   try { if (Test-Path $AutoHiOff) { Remove-Item $AutoHiOff } else { Set-Content -Path $AutoHiOff -Value '' } } catch {}
 }
-$menu.Add_Opened({ $script:HiItem.IsChecked = -not (Test-Path $AutoHiOff) })
+$menu.Add_Opened({ $script:HiItem.IsChecked = -not (Test-Path $AutoHiOff); Fill-ReloginMenu })
 $script:BgItem = Add-MenuItem 'Background' { $Prefs.bg = ([int]$Prefs.bg + 1) % 3; Apply-Background; Save-Prefs }
 $script:LockItem = Add-MenuItem 'Lock position' { $Prefs.locked = -not $Prefs.locked; $script:LockItem.IsChecked = [bool]$Prefs.locked; Save-Prefs }
 $script:LockItem.IsChecked = [bool]$Prefs.locked
@@ -2275,6 +2386,8 @@ if ($SelfTest) {   # render snapshot.json once without showing a window; print t
     $drawn = foreach ($el in @($Table.Children) + @($Summary.Children) + @($Actions.Children)) { Get-Drawn $el }
     'DRAWN=' + ($drawn -join '|')
     'FOOT=' + $Foot.Text
+    Fill-ReloginMenu
+    'RELOGIN=' + ((@($script:ReloginItem.Items) | ForEach-Object { [string]$_.Tag }) -join '|') + ' enabled=' + $script:ReloginItem.IsEnabled
     if ($Png) {   # docs image: the card alone on a neutral backdrop (no desktop behind it), 2x scale
       $win.Content = $null
       $wrap = New-Object Windows.Controls.Grid
@@ -2359,7 +2472,7 @@ async function main(argv) {
 module.exports = {
   withLock, loadAccounts, loadState, probeToken, getUsage, pickBest, judge, headroom, parseLimitWaitMs, parseRunArgs, buildArgs, redact, HOME,
   fmtShort, buildSnapshot, summaryLines, keepDefault, startWidget, WIDGET_SCRIPT, SNAPSHOT_FILE, SWITCH_MARGIN,
-  tokenFromScreen, ensureHelper, readLoginQueue, dueHis,
+  tokenFromScreen, ensureHelper, readLoginQueue, dueHis, matchCliAccount, fetchCliUsage,
 };
 
 if (require.main === module) {

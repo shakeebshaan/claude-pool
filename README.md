@@ -49,7 +49,7 @@ On Windows you also get:
 |---|---|
 | **Never stall on a limit** | `cpool` starts Claude Code on the account with the most headroom. When that account runs out (5h or 7d at 99 %, or the API answers 429), the session moves to the next account and resumes the same conversation automatically. |
 | **Same conversation, next account** | Swaps kill the `claude` process tree and relaunch `claude --resume <session id> "continue where you left off"` with the next account's token, in the same terminal window. |
-| **Every limit at a glance** | `cpool limits` and the desktop widget show 5h left, 7d left, time to each reset, and status (`in use`, `paused to 05:00`, `ready`, `needs login`, `login expired`). |
+| **Every limit at a glance** | `cpool limits` and the desktop widget show 5h left, 7d left, time to each reset, and status (`new terminals`, `in use`, `paused to 05:00`, `ready`, `needs login`, `login expired`). |
 | **Pool capacity** | *Usable* = weekly budget left across the pool, e.g. `21% · ≈1.2 of 6 accounts`. |
 | **Reset forecast** | `5h resets  first acct2 in 56m · all in 4h56 (15:20)` and the same for 7d. |
 | **One-click login** (Windows) | A **Log in** button per account (and **Log in all**). It opens a private browser window, you sign in and click Authorize, and the token is captured and stored. |
@@ -123,16 +123,28 @@ it never sees a token.
 
 ```text
   Account  5h left     7d left     Status
-› acct1     22% 2h56    88% 6d21   in use
+› acct1     22% 2h56    88% 6d21   new terminals
   acct2      0% 56m     20% 4d22   paused to 11:20
   acct3     96% 2h36     3% 1d10   ready
 Usable     ━━━━──────────  21% · ≈1.2 of 6 accounts
 5h resets  first acct2 in 56m · all in 4h56 (15:20)
 7d resets  first acct3 in 1d10 · all in 6d21 (10/17 07:24)
 Auto hi    on · last acct4 at 09:50
+Logins     new terminals → acct1 · claude /login → acct3
 ```
 
-- **›** marks the account new terminals log in with (the daemon's default) and any account a `cpool` session runs on.
+- **›** marks the account **new terminals** start on (the daemon's default, the user env var
+  `CLAUDE_CODE_OAUTH_TOKEN`) and accounts a `cpool` session is running on (**in use**).
+- **Logins** shows both logins on the PC: the account new terminals get, and the account `claude /login` is signed in
+  to (what `/status` shows). The second one is used by Claude Code started *before* the default was set, and by the
+  VS Code extension's chat panel, which keeps its own login even after a restart. Claude Code in a terminal
+  (including VS Code's integrated terminal) uses the pool, and `/status` there shows
+  `Auth token: CLAUDE_CODE_OAUTH_TOKEN`. Use `cpool` in a terminal for automatic switching, or `/login` in the panel to
+  pick an account with room. The `/login` account
+  is shown as a pool account name when one has that email (`--email`), or when exactly one account has the same 5h
+  and weekly windows (same reset times, similar use). If the account name and the mailbox differ, the email is shown
+  too, e.g. `acct1 (acct2@example.com)`, so crossed names are easy to spot. Otherwise only the email is shown; it
+  never guesses.
 - **5h left / 7d left**: percent of each limit still available, and the time until that window resets. Values of 10 %
   or less are tinted red, 30 % or less amber.
 - **Usable**: weekly budget left across the pool, sum of 7d left ÷ (accounts × 100). For example "≈1.2" means about
@@ -143,7 +155,8 @@ Auto hi    on · last acct4 at 09:50
 - Accounts not logged in yet show placeholders (`--% -h--`) and a **Log in** button. Until the first login the summary
   lines say what will appear (`after login`).
 - **Drag** to move it (the position is remembered; on the right half it grows leftwards). **Right-click**: Refresh
-  now, Add account..., Auto hi at every 5h reset, Background (clear / glass / solid), Lock position, Close widget.
+  now, Add account..., Re-login account ▸ (every account), Auto hi at every 5h reset, Background (clear / glass /
+  solid), Lock position, Close widget.
 - When the daemon stops, the widget dims and says so. If Explorer restarts, the daemon brings the widget back.
 
 ![claude-pool widget before login: Log in buttons per account, Log in all, Add account](docs/widget-login.png)
@@ -171,7 +184,9 @@ Failures stay at the bottom of the widget for 5 minutes. `CLAUDE_POOL_LOGIN_BROW
 `none` only prints the URL.
 
 Setup tokens are valid for about a year. When one stops working, the account shows **login expired** with a
-**Log in** button.
+**Log in** button. To switch an account that is already logged in to another login (for example after signing in
+with the wrong account), right-click the widget → **Re-login account** → the account, or run `cpool login <name>`.
+The new token replaces the old one.
 
 ## Auto hi at every 5h reset
 
@@ -266,6 +281,7 @@ Everything lives in `~/.claude-pool` (`%USERPROFILE%\.claude-pool`):
 | `state.json` | Shared limit cache, live `cpool` sessions, current default account |
 | `snapshot.json` | What the widget shows: names and numbers only, **no tokens** |
 | `login.json`, `login.queue`, `autohi.json` | Login progress, queued widget logins, last auto hi |
+| `cli-usage.json` | 5h / 7d usage of the `claude /login` account (for the Logins line; no token) |
 | `widget.ps1`, `widget.vbs`, `background.vbs`, `widget-prefs.json` | Widget script (rewritten on start), hidden launchers, position / background |
 | `cpool-helper-*.exe` / `.cs` | The login helper and its source |
 | `pool.log`, `widget.log` | Logs (tokens redacted) |
@@ -275,6 +291,9 @@ Everything lives in `~/.claude-pool` (`%USERPROFILE%\.claude-pool`):
 - Every line claude-pool prints or logs passes through a redactor that shortens any `sk-ant-...` token to its last 4
   characters. The tests check that no token reaches stdout, stderr, logs or the widget data.
 - Tokens are only sent to `api.anthropic.com` (limit probes) and passed to `claude` in its environment.
+- For the Logins line the daemon reads the access token of your `claude /login` from `~/.claude/.credentials.json`,
+  read-only and every 5 minutes. It calls Anthropic's usage endpoint with it (the same call `/usage` makes, which
+  spends no tokens). It never refreshes, stores or prints that token, and skips the call when the token has expired.
 - The login helper never stores the screen; the captured token goes straight into `accounts.json`.
 
 ## How usage limits are read

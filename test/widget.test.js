@@ -14,6 +14,8 @@ const SCRIPT = path.join(__dirname, "..", "claude-pool.js");
 const UNIT_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "cpool-unit-"));
 process.env.CLAUDE_POOL_HOME = UNIT_HOME;
 process.env.CLAUDE_POOL_NO_SYSTEM = "1";
+// never touch the real ~/.claude (credentials, /login account) - children inherit this too
+process.env.CLAUDE_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "cpool-claudecfg-"));
 const pool = require(SCRIPT);
 
 const MIN = 60000;
@@ -59,7 +61,7 @@ test("snapshot reproduces the requested panel: rows, usable bar, reset lines", (
   const s = pool.buildSnapshot(acc, st, NOW);
   const byName = Object.fromEntries(s.rows.map((r) => [r.name, r]));
   assert.deepEqual(s.rows.map((r) => r.name), ["acct1", "acct2", "acct3", "acct4", "acct5", "acct6"], "pool order kept");
-  assert.deepEqual(byName.acct1, { name: "acct1", active: true, h5: { left: 22, reset: "2h56" }, d7: { left: 88, reset: "6d21" }, status: "in use", kind: "active", stale: false });
+  assert.deepEqual(byName.acct1, { name: "acct1", active: true, h5: { left: 22, reset: "2h56" }, d7: { left: 88, reset: "6d21" }, status: "new terminals", kind: "active", stale: false });
   assert.equal(byName.acct2.status, `paused to ${clock(NOW + 56 * MIN)}`);
   assert.deepEqual(byName.acct2.h5, { left: 0, reset: "56m" });
   assert.deepEqual(byName.acct3.d7, { left: 3, reset: "1d10" });
@@ -153,8 +155,9 @@ test("widget renders the panel: arrow row, columns, usable, resets; no footer wh
   snap.daemon = { pid: 1, everyMs: 120000 };
   const r = widgetSelfTest(snap);
   assert.equal(r.code, 0, r.out);
-  for (const s of ["acct1", "22%", "2h56", "88%", "6d21", "in use", "acct6", "21%", "of 6 accounts", "first acct2 in 56m", "first acct3 in 1d10"]) assert.ok(r.out.includes(s), `missing ${s}: ${r.out}`);
+  for (const s of ["acct1", "22%", "2h56", "88%", "6d21", "new terminals", "acct6", "Logins", "new terminals → acct1", "21%", "of 6 accounts", "first acct2 in 56m", "first acct3 in 1d10"]) assert.ok(r.out.includes(s), `missing ${s}: ${r.out}`);
   assert.match(r.out, /FOOT=\s*$/m, "no footer when fresh");
+  assert.match(r.out, /RELOGIN=acct1\|acct2\|acct3\|acct4\|acct5\|acct6 enabled=True/, "right-click Re-login lists every account");
 });
 test("widget tells stale / stopped daemon and empty pool apart", { skip: process.platform !== "win32" }, () => {
   const { acc, st } = samplePool();
@@ -170,7 +173,76 @@ test("widget tells stale / stopped daemon and empty pool apart", { skip: process
   assert.equal(e.code, 0, e.out);
   assert.match(e.out, /DRAWN=no accounts yet\|\[\+ Add account\]/);
   assert.match(e.out, /FOOT=add your Claude accounts with \+ Add account/);
+  assert.match(e.out, /RELOGIN= enabled=False/, "nothing to re-login in an empty pool");
   assert.match(widgetSelfTest(null).out, /FOOT=waiting for the pool daemon/);
+});
+
+test("logins: the default reads 'new terminals', a cpool session 'in use', and claude /login is shown (by name when an account has that email)", () => {
+  const { acc, st } = samplePool();
+  let s = pool.buildSnapshot(acc, st, NOW, null, [], { on: true }, { email: "Someone@Example.com", org: "Org" });
+  assert.equal(s.rows[0].status, "new terminals");
+  assert.equal(s.logins.text, "new terminals → acct1 · claude /login → Someone@Example.com");
+  acc.accounts[1].email = "someone@example.com";
+  st.sessions = { 7: { pid: 7, accountId: "id-acct1" } };
+  s = pool.buildSnapshot(acc, st, NOW, null, [], { on: true }, { email: "Someone@Example.com" });
+  assert.equal(s.rows[0].status, "in use", "a live cpool session beats the default label");
+  assert.equal(s.logins.text, "new terminals → acct1 · claude /login → acct2");
+  assert.equal(pool.buildSnapshot(acc, st, NOW, null, [], { on: true }, { email: "acct4@example.com" }).logins.cli, "acct4@example.com", "no guessing from the mailbox name");
+  st.defaultAccountId = null;
+  assert.equal(pool.buildSnapshot(acc, st, NOW).logins.text, "new terminals → their own claude /login");
+});
+
+test("claude /login is matched to a pool account by its usage windows - unique match only, named with its real email when they differ", () => {
+  const { acc, st } = samplePool();
+  const u3 = st.usage["id-acct3"]; // acct3: 5h 96% left, 7d 3% left
+  const cliUsage = { session: { used: u3.session.used + 1, resetsAt: u3.session.resetsAt - 1000 }, weekly: { used: u3.weekly.used, resetsAt: u3.weekly.resetsAt + 1000 } };
+  assert.equal(pool.matchCliAccount(acc, st.usage, cliUsage).name, "acct3");
+  const s = pool.buildSnapshot(acc, st, NOW, null, [], { on: true }, { email: "acct2@example.com", usage: cliUsage });
+  assert.equal(s.logins.text, "new terminals → acct1 · claude /login → acct3 (acct2@example.com)", "names crossed: show the real email");
+  assert.equal(pool.buildSnapshot(acc, st, NOW, null, [], { on: true }, { email: "acct3@example.com", usage: cliUsage }).logins.cli, "acct3");
+  // a second account with the same windows makes it ambiguous -> no name
+  st.usage["id-acct4"] = JSON.parse(JSON.stringify(u3));
+  assert.equal(pool.matchCliAccount(acc, st.usage, cliUsage), null);
+  assert.equal(pool.matchCliAccount(acc, st.usage, null), null);
+  assert.equal(pool.matchCliAccount(acc, st.usage, { weekly: { used: 50, resetsAt: NOW + 9 * 86400000 } }), null, "no match");
+});
+
+test("cli usage: read with the /login access token from the official usage endpoint; expired token = no request", async () => {
+  const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "cpool-cfg-"));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cpool-cli-"));
+  fs.writeFileSync(path.join(cfg, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "me@example.com", organizationName: "Org" } }));
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    seen.push({ url: req.url, auth: req.headers.authorization });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ five_hour: { utilization: 40, resets_at: "2026-10-10T15:30:00Z" }, seven_day: { utilization: 97, resets_at: "2026-10-15T03:00:00Z" } }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  // async child: the mock server lives in this process and must keep answering
+  const run = () =>
+    new Promise((resolve) => {
+      const c = spawn(process.execPath, ["-e", `require(${JSON.stringify(SCRIPT)}).fetchCliUsage().then((v) => console.log(JSON.stringify(v)))`], {
+        env: { ...process.env, CLAUDE_CONFIG_DIR: cfg, CLAUDE_POOL_HOME: home, CLAUDE_POOL_PROBE_URL: `http://127.0.0.1:${server.address().port}` },
+      });
+      let out = "";
+      c.stdout.on("data", (d) => (out += d));
+      c.on("exit", () => resolve(out.trim()));
+    });
+  try {
+    const at = token("C");
+    fs.writeFileSync(path.join(cfg, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: at, expiresAt: Date.now() + 3600000 } }));
+    const v = JSON.parse(await run());
+    assert.equal(v.email, "me@example.com");
+    assert.deepEqual(v.session, { used: 40, resetsAt: Date.parse("2026-10-10T15:30:00Z") });
+    assert.deepEqual(v.weekly, { used: 97, resetsAt: Date.parse("2026-10-15T03:00:00Z") });
+    assert.equal(seen[0].url, "/api/oauth/usage");
+    assert.equal(seen[0].auth, `Bearer ${at}`);
+    fs.writeFileSync(path.join(cfg, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: at, expiresAt: Date.now() - 1000 } }));
+    assert.equal(await run(), "null", "expired: skipped, never refreshed");
+    assert.equal(seen.length, 1, "no request with an expired token");
+  } finally {
+    server.close();
+  }
 });
 
 // ---------------------------------------------------------------- auto hi + placeholder text
