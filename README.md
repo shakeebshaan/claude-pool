@@ -97,6 +97,12 @@ cpool limits                  :: table of all accounts
 
 Everything after `cpool` is passed to `claude` unchanged.
 
+**Prefer typing `claude`?** Run `cpool shim on`. A small `claude.exe` goes first on your user PATH, and in new terminals
+`claude` then starts a pool session with live account switching. Commands that are not sessions (`claude update`,
+`claude mcp ...`, `claude doctor`, `claude -p ...`, `claude --bg`, `--version`, `--help`) go straight to the real
+claude. Programs that run claude by full path, such as the VS Code chat panel, are not affected. `cpool shim` shows
+what new terminals will run; `cpool shim off` undoes it.
+
 ## Quick start (macOS / Linux)
 
 ```sh
@@ -254,6 +260,7 @@ Wrapper flags (never passed to claude): `--pool-account <name>`, `--pool-poll <s
 | `cpool background [on\|off]` | Windows: daemon (2 min) + widget, hidden, now and at every logon; no argument = status |
 | `cpool widget [stop]` | Show / close the desktop widget |
 | `cpool autohi [on\|off]` | Auto hi at every 5h reset (default on) |
+| `cpool shim [on\|off]` | Windows: plain `claude` in new terminals starts a pool session (non-session commands pass through); no argument = status |
 | `cpool install` | Copy to `~/.claude-pool`, write the `cpool` / `claude-p` shims, add them to PATH |
 | `cpool help` / `version` | Usage / version |
 

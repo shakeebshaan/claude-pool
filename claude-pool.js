@@ -49,6 +49,10 @@ COMMANDS
                                    every logon (HKCU Run -> wscript background.vbs). No argument = status.
   cpool widget [stop]              show / close the transparent desktop widget (drag to move, right-click for
                                    refresh, add account, re-login account, auto hi, background, lock position, close)
+  cpool shim [on|off]              Windows: make plain `claude` start through the pool in new terminals (a small
+                                   claude.exe first on the user PATH). Sessions switch accounts on limits;
+                                   subcommands, -p, --bg, --version, --help go straight to the real claude.
+                                   No argument = status.
   cpool autohi [on|off]            auto hi (default on, part of the daemon): the moment an account's 5h window
                                    resets, send it a 1-token "hi" so the next window starts at once - 24/7 while
                                    the PC is awake. CLAUDE_POOL_AUTO_HI=0 also turns it off.
@@ -583,6 +587,13 @@ function earliestReset() {
 }
 
 // ---------------------------------------------------------------- claude binary + launching
+// Pure. The real claude among the candidates: never one of our own shims (cpool shim puts a claude.exe into
+// HOME/bin, first on PATH - launching it would loop back into cpool). .exe beats .cmd.
+function chooseClaude(candidates, ownBin, exists = fs.existsSync) {
+  const own = path.resolve(ownBin).toLowerCase();
+  const real = candidates.filter((p) => path.resolve(path.dirname(p)).toLowerCase() !== own && exists(p));
+  return real.find((p) => /\.exe$/i.test(p)) || real.find((p) => /\.cmd$/i.test(p)) || real[0] || null;
+}
 function resolveClaude() {
   const envBin = process.env.CLAUDE_POOL_CLAUDE_BIN;
   if (envBin) return envBin;
@@ -595,9 +606,7 @@ function resolveClaude() {
     } catch {}
     candidates.push(path.join(home, ".local", "bin", "claude.exe"));
     if (process.env.APPDATA) candidates.push(path.join(process.env.APPDATA, "npm", "claude.cmd"));
-    const existing = candidates.filter((p) => fs.existsSync(p));
-    const pick = existing.find((p) => /\.exe$/i.test(p)) || existing.find((p) => /\.cmd$/i.test(p)) || existing[0];
-    return pick || "claude.cmd";
+    return chooseClaude(candidates, path.join(HOME, "bin")) || "claude.cmd";
   }
   try {
     const r = spawnSync("sh", ["-lc", "command -v claude"], { encoding: "utf8" });
@@ -1520,6 +1529,24 @@ async function cmdDaemon(args = []) {
 }
 
 // ---------------------------------------------------------------- install
+// The user PATH (HKCU\Environment\Path) as a list; writing it back also tells running programs, so new terminals see it.
+const samePath = (a, b) => a.replace(/[\\/]+$/, "").toLowerCase() === b.replace(/[\\/]+$/, "").toLowerCase();
+function readUserPath() {
+  try {
+    const r = spawnSync("reg", ["query", "HKCU\\Environment", "/v", "Path"], { encoding: "utf8", windowsHide: true });
+    const m = (r.stdout || "").match(/Path\s+REG_(?:EXPAND_)?SZ\s+(.*)/i);
+    return m ? m[1].trim().split(";").filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+function writeUserPath(parts) {
+  const r = spawnSync("reg", ["add", "HKCU\\Environment", "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", parts.join(";"), "/f"], { stdio: "ignore", windowsHide: true });
+  if (r.status !== 0) return false;
+  const ps = "$s=Add-Type -Name W -Namespace P -PassThru -MemberDefinition '[DllImport(\"user32.dll\",SetLastError=true,CharSet=CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr h,uint m,UIntPtr w,string l,uint f,uint t,out UIntPtr r);'; [UIntPtr]$r=[UIntPtr]::Zero; $s::SendMessageTimeout([IntPtr]0xffff,0x1A,[UIntPtr]::Zero,'Environment',2,5000,[ref]$r) | Out-Null";
+  spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps], { stdio: "ignore", windowsHide: true });
+  return true;
+}
 function cmdInstall() {
   ensureHome();
   const dest = path.join(HOME, "claude-pool.js");
@@ -1532,24 +1559,10 @@ function cmdInstall() {
     out(`[pool] wrote ${path.join(bin, "cpool.cmd")} and claude-p.cmd (both = node claude-pool.js ...; the real \`claude\` is untouched)`);
     if (NO_SYSTEM) out("[pool] (CLAUDE_POOL_NO_SYSTEM) skipped PATH update");
     else {
-      let cur = "";
-      try {
-        const r = spawnSync("reg", ["query", "HKCU\\Environment", "/v", "Path"], { encoding: "utf8", windowsHide: true });
-        const m = (r.stdout || "").match(/Path\s+REG_(?:EXPAND_)?SZ\s+(.*)/i);
-        if (m) cur = m[1].trim();
-      } catch {}
-      const parts = cur.split(";").filter(Boolean);
-      if (parts.some((p) => p.replace(/\\+$/, "").toLowerCase() === bin.toLowerCase())) out("[pool] bin folder already on the user PATH");
-      else {
-        const next = [...parts, bin].join(";");
-        const r = spawnSync("reg", ["add", "HKCU\\Environment", "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", next, "/f"], { stdio: "ignore", windowsHide: true });
-        if (r.status !== 0) err(`[pool] could not update the user PATH - add this folder yourself: ${bin}`);
-        else {
-          const ps = "$s=Add-Type -Name W -Namespace P -PassThru -MemberDefinition '[DllImport(\"user32.dll\",SetLastError=true,CharSet=CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr h,uint m,UIntPtr w,string l,uint f,uint t,out UIntPtr r);'; [UIntPtr]$r=[UIntPtr]::Zero; $s::SendMessageTimeout([IntPtr]0xffff,0x1A,[UIntPtr]::Zero,'Environment',2,5000,[ref]$r) | Out-Null";
-          spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps], { stdio: "ignore", windowsHide: true });
-          out(`[pool] added ${bin} to the user PATH - open a NEW cmd window, then type cpool`);
-        }
-      }
+      const parts = readUserPath();
+      if (parts.some((p) => samePath(p, bin))) out("[pool] bin folder already on the user PATH");
+      else if (!writeUserPath([...parts, bin])) err(`[pool] could not update the user PATH - add this folder yourself: ${bin}`);
+      else out(`[pool] added ${bin} to the user PATH - open a NEW cmd window, then type cpool`);
     }
   } else {
     const f = path.join(bin, "cpool");
@@ -1867,6 +1880,131 @@ async function cmdLogin(args) {
   process.off("SIGINT", onInt);
   if (r.state === "done") return out(`[pool] ${r.name} logged in${r.message ? ` (${r.message})` : ""}`), 0;
   return err(`[pool] ${r.name}: ${r.message}`), 1;
+}
+
+// ---------------------------------------------------------------- `claude` = a pool session (Windows, opt-in)
+// cpool shim on: a tiny claude.exe in HOME/bin, first on the user PATH. Typing `claude` runs
+// `node claude-pool.js shim-run <same args>`: sessions go through cpool (live account switching); anything that is not
+// an interactive session goes straight to the real claude. An .exe rather than a .cmd: no "Terminate batch job (Y/N)?"
+// after Ctrl+C and no % expansion in prompts. Apps that run claude by full path (the VS Code panel) are not affected.
+const CLAUDE_SUBCOMMANDS = new Set([
+  "agents", "attach", "auth", "auto-mode", "doctor", "gateway", "import", "install", "logs", "mcp", "plugin", "plugins",
+  "purge", "respawn", "rm", "setup-token", "stop", "kill", "ultrareview", "update", "upgrade", "help",
+]);
+const PASS_FLAGS = new Set(["-p", "--print", "--bg", "-v", "--version", "-h", "--help"]);
+const passThrough = (argv) => (argv.length > 0 && CLAUDE_SUBCOMMANDS.has(argv[0])) || argv.some((a) => PASS_FLAGS.has(a));
+async function cmdShimRun(argv) {
+  const ready = loadAccounts().accounts.some((a) => a.enabled && a.token && !a.dead);
+  if (ready && !passThrough(argv)) return cmdRun(argv);
+  // not a session, or nothing in the pool yet: be the real claude, untouched
+  const bin = resolveClaude();
+  const child = IS_WIN && /\.(cmd|bat)$/i.test(bin) ? spawn([bin, ...argv].map(winQuote).join(" "), { stdio: "inherit", shell: true }) : spawn(bin, argv, { stdio: "inherit" });
+  const ignore = () => {}; // Ctrl+C belongs to claude
+  process.on("SIGINT", ignore);
+  const res = await waitExit(child);
+  process.off("SIGINT", ignore);
+  if (res.error) return err(`[pool] could not start claude (${bin}): ${res.error.message}`), 127;
+  return res.code == null ? 1 : res.code;
+}
+const SHIM_SRC = String.raw`using System;
+using System.Diagnostics;
+using System.IO;
+
+// claude-pool shim (cpool shim on): typing claude runs  node claude-pool.js shim-run <the same arguments>.
+public static class ClaudePoolShim {
+  const string NODE = NODE_PATH_LITERAL;
+  public static int Main(string[] args) {
+    Console.CancelKeyPress += (s, e) => { e.Cancel = true; }; // Ctrl+C belongs to claude, not to this shim
+    string dir = Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName);
+    string script = Path.GetFullPath(Path.Combine(dir, "..", "claude-pool.js"));
+    var psi = new ProcessStartInfo(File.Exists(NODE) ? NODE : "node", "\"" + script + "\" shim-run " + RawArgs());
+    psi.UseShellExecute = false;
+    try {
+      using (var p = Process.Start(psi)) { p.WaitForExit(); return p.ExitCode; }
+    } catch (Exception e) {
+      Console.Error.WriteLine("claude (claude-pool shim): could not start node: " + e.Message + " - cpool shim off restores the real claude");
+      return 127;
+    }
+  }
+  // everything after the program name, exactly as typed (no re-quoting)
+  static string RawArgs() {
+    string cl = Environment.CommandLine;
+    int i = 0;
+    if (cl.Length > 0 && cl[0] == '"') { i = cl.IndexOf('"', 1); i = i < 0 ? cl.Length : i + 1; }
+    else { while (i < cl.Length && cl[i] != ' ' && cl[i] != '\t') i++; }
+    return cl.Substring(i).TrimStart();
+  }
+}
+`;
+function buildShim() {
+  ensureHome();
+  const bin = path.join(HOME, "bin");
+  fs.mkdirSync(bin, { recursive: true });
+  const srcFile = path.join(HOME, "claude-shim.cs");
+  fs.writeFileSync(srcFile, SHIM_SRC.replace("NODE_PATH_LITERAL", JSON.stringify(process.execPath))); // a JSON string is a valid C# literal
+  const tmp = path.join(bin, `claude-new-${process.pid}.exe`);
+  const ps = "Add-Type -TypeDefinition ([IO.File]::ReadAllText($env:CPOOL_SRC)) -OutputAssembly $env:CPOOL_EXE -OutputType ConsoleApplication";
+  const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps], {
+    env: { ...process.env, CPOOL_SRC: srcFile, CPOOL_EXE: tmp },
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (!fs.existsSync(tmp)) throw new Error(`could not build the claude shim: ${(r.stderr || r.stdout || "").trim().slice(0, 300)}`);
+  const dest = path.join(bin, "claude.exe");
+  try {
+    fs.renameSync(tmp, dest);
+  } catch {
+    try {
+      fs.renameSync(dest, `${dest}.old-${Date.now()}`); // a running claude.exe can be renamed, not overwritten
+    } catch {}
+    fs.renameSync(tmp, dest);
+  }
+  for (const f of fs.readdirSync(bin)) if (/^claude\.exe\.old-\d+$/.test(f)) takeFlag(path.join(bin, f));
+  return dest;
+}
+// first claude a NEW terminal finds: machine PATH, then user PATH (from the registry, not this process's PATH)
+function claudeForNewTerminals() {
+  const q = spawnSync("reg", ["query", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/v", "Path"], { encoding: "utf8", windowsHide: true });
+  const m = (q.stdout || "").match(/Path\s+REG_(?:EXPAND_)?SZ\s+(.*)/i);
+  const dirs = [...(m ? m[1].trim().split(";") : []), ...readUserPath()].filter(Boolean).map((d) => d.replace(/%([^%]+)%/g, (x, v) => process.env[v] || x));
+  for (const d of dirs) for (const ext of [".exe", ".cmd", ".bat"]) if (fs.existsSync(path.join(d, "claude" + ext))) return path.join(d, "claude" + ext);
+  return null;
+}
+function cmdShim(sub) {
+  if (!IS_WIN) return err("[pool] the claude shim is Windows-only; on macOS / Linux add  alias claude=cpool  to your shell rc"), 2;
+  const bin = path.join(HOME, "bin");
+  const shim = path.join(bin, "claude.exe");
+  if (sub === "on") {
+    const script = path.join(HOME, "claude-pool.js"); // where the shim looks for it
+    if (path.resolve(__filename).toLowerCase() !== script.toLowerCase()) fs.copyFileSync(__filename, script);
+    try {
+      buildShim();
+    } catch (e) {
+      return err(`[pool] ${e.message}`), 1;
+    }
+    if (NO_SYSTEM) out("[pool] (CLAUDE_POOL_NO_SYSTEM) skipped the PATH change");
+    else if (!writeUserPath([bin, ...readUserPath().filter((p) => !samePath(p, bin))])) return err("[pool] could not update the user PATH"), 1;
+    out("[pool] claude now starts through the pool in NEW terminals: sessions switch accounts when one hits its limit.");
+    out(`[pool] claude update / mcp / -p / --bg / --version ... go straight to the real claude (${resolveClaude()}). The VS Code panel is not affected.`);
+    out("[pool] undo: cpool shim off");
+    log("shim on");
+    return 0;
+  }
+  if (sub === "off") {
+    if (!takeFlag(shim)) {
+      try {
+        fs.renameSync(shim, `${shim}.old-${Date.now()}`);
+      } catch {}
+    }
+    out("[pool] claude is the real claude again in new terminals (cpool still works). Already open terminals keep what they had.");
+    log("shim off");
+    return 0;
+  }
+  const found = claudeForNewTerminals();
+  out(`shim      ${fs.existsSync(shim) ? "on" : "off"} (${shim})`);
+  out(`claude    new terminals run: ${found || "not found"}${found && samePath(path.dirname(found), bin) ? " -> pool session" : ""}`);
+  out(`real      ${resolveClaude()}`);
+  return 0;
 }
 
 // ---------------------------------------------------------------- background (Windows): daemon + desktop widget
@@ -2449,6 +2587,8 @@ const COMMANDS = {
   bg: (a) => cmdBackground(a[0]),
   widget: (a) => cmdWidget(a[0]),
   autohi: (a) => cmdAutoHi(a[0]),
+  shim: (a) => cmdShim(a[0]),
+  "shim-run": (a) => cmdShimRun(a),
   install: () => cmdInstall(),
   help: () => help(),
   "--help": () => help(),
@@ -2472,7 +2612,7 @@ async function main(argv) {
 module.exports = {
   withLock, loadAccounts, loadState, probeToken, getUsage, pickBest, judge, headroom, parseLimitWaitMs, parseRunArgs, buildArgs, redact, HOME,
   fmtShort, buildSnapshot, summaryLines, keepDefault, startWidget, WIDGET_SCRIPT, SNAPSHOT_FILE, SWITCH_MARGIN,
-  tokenFromScreen, ensureHelper, readLoginQueue, dueHis, matchCliAccount, fetchCliUsage,
+  tokenFromScreen, ensureHelper, readLoginQueue, dueHis, matchCliAccount, fetchCliUsage, passThrough, chooseClaude, buildShim,
 };
 
 if (require.main === module) {

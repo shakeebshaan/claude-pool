@@ -14,7 +14,7 @@ Use it when Claude Code keeps stopping with "usage limit reached" and you have m
 ## Quick facts
 
 - Install: `node claude-pool.js install` (writes the `cpool` command), then `cpool background on` on Windows
-- Run Claude Code with live account switching: `cpool [any claude arguments]`
+- Run Claude Code with live account switching: `cpool [any claude arguments]`, or `cpool shim on` (Windows) so plain `claude` does the same
 - See all limits: `cpool limits`
 - Add an account: widget "Log in" / "+ Add account", or `cpool login <name>`, or `claude setup-token` + `cpool add <name>`
 - Limits are read from the `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}` headers of a 1-token Haiku request

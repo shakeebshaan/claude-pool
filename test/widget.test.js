@@ -245,6 +245,63 @@ test("cli usage: read with the /login access token from the official usage endpo
   }
 });
 
+// ---------------------------------------------------------------- claude shim (typing claude = a pool session)
+test("shim routing: sessions go through the pool; subcommands, -p, --bg, --version, --help go straight to claude", () => {
+  for (const a of [[], ["fix the tests"], ["-c"], ["--resume", "abc"], ["--model", "opus", "hi"], ["--model", "mcp"]]) assert.equal(pool.passThrough(a), false, JSON.stringify(a));
+  for (const a of [["mcp", "list"], ["update"], ["doctor"], ["setup-token"], ["-p", "hi"], ["--print"], ["--bg"], ["--version"], ["-v"], ["--help"], ["plugins"]]) assert.equal(pool.passThrough(a), true, JSON.stringify(a));
+});
+
+test("the pool never launches its own claude shim (no loop), and prefers claude.exe", () => {
+  const own = path.join("C:", "pool", "bin");
+  const yes = () => true;
+  assert.equal(pool.chooseClaude([path.join(own, "claude.exe"), path.join("C:", "u", ".local", "bin", "claude.exe")], own, yes), path.join("C:", "u", ".local", "bin", "claude.exe"));
+  assert.equal(pool.chooseClaude([path.join("C:", "npm", "claude.cmd"), path.join("C:", "x", "claude.exe")], own, yes), path.join("C:", "x", "claude.exe"));
+  assert.equal(pool.chooseClaude([path.join(own, "claude.exe")], own, yes), null);
+});
+
+function buildShimIn(home) {
+  const r = spawnSync(process.execPath, ["-e", `require(${JSON.stringify(SCRIPT)}).buildShim()`], { env: { ...process.env, CLAUDE_POOL_HOME: home }, encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  return path.join(home, "bin", "claude.exe");
+}
+
+test("shim exe passes arguments exactly as typed and returns the exit code", { skip: process.platform !== "win32" }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cpool-shim-"));
+  const exe = buildShimIn(home);
+  // stand-in for claude-pool.js next to bin/: echoes what it got
+  fs.writeFileSync(path.join(home, "claude-pool.js"), "process.stdout.write(JSON.stringify(process.argv.slice(2))); process.exit(7);");
+  const args = ["fix the tests", "100%", "%PATH%", "a&b", 'say "hi"', "--flag"];
+  const r = spawnSync(exe, args, { encoding: "utf8" });
+  assert.equal(r.status, 7, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), ["shim-run", ...args]);
+});
+
+test("typing claude: a session runs through the pool, `claude mcp list` / `claude -p` reach the real claude untouched", { skip: process.platform !== "win32" }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cpool-shim2-"));
+  fs.copyFileSync(SCRIPT, path.join(home, "claude-pool.js"));
+  const exe = buildShimIn(home);
+  const tok = token("S");
+  const api = await mockApi({ [tok]: [0.1, 0.1] });
+  const outFile = path.join(home, "fake-argv.txt");
+  fs.writeFileSync(path.join(home, "fake.js"), `require("fs").appendFileSync(${JSON.stringify(outFile)}, JSON.stringify(process.argv.slice(2)) + "\\n");`);
+  fs.writeFileSync(path.join(home, "fake.cmd"), `@"${process.execPath}" "%~dp0fake.js" %*\r\n`);
+  const env = { ...process.env, CLAUDE_POOL_HOME: home, CLAUDE_POOL_NO_SYSTEM: "1", CLAUDE_POOL_PROBE_URL: api.url, CLAUDE_POOL_CLAUDE_BIN: path.join(home, "fake.cmd") };
+  const run = (args) => new Promise((resolve) => spawn(exe, args, { env, stdio: "ignore" }).on("exit", resolve));
+  try {
+    assert.equal(spawnSync(process.execPath, [path.join(home, "claude-pool.js"), "add", "acctS", tok], { env }).status, 0);
+    assert.equal(await run(["hello"]), 0);
+    assert.equal(await run(["mcp", "list"]), 0);
+    assert.equal(await run(["-p", "hi"]), 0);
+    const calls = fs.readFileSync(outFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(calls.length, 3);
+    assert.ok(calls[0].includes("--session-id") && calls[0].includes("hello"), `session went through cpool: ${calls[0]}`);
+    assert.deepEqual(calls[1], ["mcp", "list"]);
+    assert.deepEqual(calls[2], ["-p", "hi"]);
+  } finally {
+    api.server.close();
+  }
+});
+
 // ---------------------------------------------------------------- auto hi + placeholder text
 test("auto hi: due 5 s after a 5h reset, once per reset, retry respected, never for weekly-exhausted / dead / not-logged-in", () => {
   const { acc, st } = samplePool();
