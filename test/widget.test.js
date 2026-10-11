@@ -633,6 +633,168 @@ test("all accounts out: after waiting for a reset, cpool resumes on that same ac
   }
 });
 
+// ---------------------------------------------------------------- other AI providers (API keys)
+const rnd = (n, set = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") => Array.from(crypto.randomBytes(n), (b) => set[b % set.length]).join("");
+function fakeKeyFile() {
+  const k = {
+    replicate: "r8_" + rnd(37), groq: rnd(40), cloudflare: rnd(40), huggingface: "hf_" + rnd(34), cohere: rnd(40), together: rnd(64, "0123456789abcdef"),
+    mistral: rnd(32), nvidia: "nvapi-" + rnd(64), openrouter: "sk-or-v1-" + rnd(64, "0123456789abcdef"), gemini: "AQ." + rnd(50),
+  };
+  const text = [
+    `replicate_api_token = "${k.replicate}"`, `groq_api = "${k.groq}"`, `cloudflare_api = "${k.cloudflare}"`, `huggingface_api = "${k.huggingface}"`,
+    `cohere_api ="${k.cohere}"`, `together_api = "${k.together}"`, `mistral_api = "${k.mistral}"`, `nvidia__api = "${k.nvidia}"`,
+    `openrouter_api ="${k.openrouter}"`, `aistudio_="${k.gemini}"`,
+  ].join("\r\n");
+  return { k, text };
+}
+const runCpool = (args, env) =>
+  new Promise((resolve) => {
+    const c = spawn(process.execPath, [SCRIPT, ...args], { env });
+    let out = "", errs = "";
+    c.stdout.on("data", (d) => (out += d));
+    c.stderr.on("data", (d) => (errs += d));
+    c.on("exit", (status) => resolve({ status, out, err: errs }));
+  });
+function providerMock({ groqOut = false, groq401 = false, mistralZero = false } = {}) {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      const p = req.url.split("?")[0];
+      seen.push({ p, auth: req.headers.authorization || req.headers["x-goog-api-key"] || "" });
+      const json = (code, body, headers = {}) => res.writeHead(code, { "content-type": "application/json", ...headers }).end(JSON.stringify(body));
+      if (p === "/api/v1/key") return json(200, { data: { limit: null, usage: 4.5, is_free_tier: false } });
+      if (p === "/api/v1/credits") return json(200, { data: { total_credits: 10, total_usage: 4.5 } });
+      if (p === "/openai/v1/chat/completions") {
+        if (groq401) return json(401, { error: { message: "Invalid API Key" } });
+        if (groqOut) return json(429, { error: { message: "Rate limit reached for requests per day" } }, { "x-ratelimit-limit-requests": "14400", "x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "1h0m0s" });
+        return json(200, {}, { "x-ratelimit-limit-requests": "14400", "x-ratelimit-remaining-requests": "14000", "x-ratelimit-reset-requests": "2m59.56s" });
+      }
+      if (p === "/v1/chat/completions") {
+        if (mistralZero) return json(429, { message: "Rate limit exceeded" }, { "x-ratelimit-limit-req-minute": "0", "x-ratelimit-remaining-req-minute": "0" });
+        return json(200, {}, { "x-ratelimit-limit-tokens-month": "1000000000", "x-ratelimit-remaining-tokens-month": "999000000" });
+      }
+      if (p === "/v1beta/models") return json(200, { models: [] });
+      if (p === "/v1/check-api-key") return json(200, { valid: true });
+      if (p === "/v1/models") return json(401, { error: { message: "invalid key" } }); // together: rejected
+      if (p === "/client/v4/user/tokens/verify") return json(200, { result: { status: "active" } });
+      if (p === "/api/whoami-v2" || p === "/v1/account") return json(200, { name: "someone" });
+      json(404, {});
+    });
+  });
+  return new Promise((r) => server.listen(0, "127.0.0.1", () => r({ server, seen, url: `http://127.0.0.1:${server.address().port}` })));
+}
+
+test("keys file: every provider recognised (by key prefix, else by its label), sensible names", () => {
+  const { text } = fakeKeyFile();
+  const f = pool.parseKeyFile(text);
+  assert.deepEqual(f.map((x) => x.provider), ["replicate", "groq", "cloudflare", "huggingface", "cohere", "together", "mistral", "nvidia", "openrouter", "gemini"]);
+  assert.deepEqual(f.map((x) => pool.providerName(x.label, x.provider)), ["replicate", "groq", "cloudflare", "huggingface", "cohere", "together", "mistral", "nvidia", "openrouter", "aistudio"]);
+  assert.equal(pool.durMs("2m59.56s"), 179560);
+  assert.equal(pool.durMs("1h0m0s"), 3600000);
+  assert.equal(pool.durMs("7"), 7000);
+});
+
+test("redaction covers every provider key format and the exact value of keys without a known prefix", () => {
+  const { k } = fakeKeyFile();
+  const r = (s) => pool.redact(s);
+  for (const p of ["replicate", "huggingface", "nvidia", "openrouter", "gemini"]) assert.ok(!r(`x ${k[p]} y`).includes(k[p].slice(8)), p);
+  // prefix-less formats (Cohere, Together, Mistral, Cloudflare) are redacted by value once stored - see the import test
+});
+
+test("cpool keys import + check: limits where providers report them, key checks elsewhere; nothing secret printed or in the widget data", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cpool-keys-"));
+  const { k, text } = fakeKeyFile();
+  const file = path.join(home, "keys.txt");
+  fs.writeFileSync(file, text);
+  const api = await providerMock();
+  const env = { ...process.env, CLAUDE_POOL_HOME: home, CLAUDE_POOL_NO_SYSTEM: "1", CLAUDE_POOL_PROVIDER_BASE: api.url };
+  try {
+    // async: the mock lives in this process and must keep answering while cpool checks the keys
+    const r = await runCpool(["keys", "import", file], env);
+    assert.equal(r.status, 0, r.err);
+    for (const v of Object.values(k)) assert.ok(!(r.out + r.err).includes(v.slice(4, 24)), "a key was printed");
+    const st = JSON.parse(fs.readFileSync(path.join(home, "providers-state.json"), "utf8")).readings;
+    const doc = JSON.parse(fs.readFileSync(path.join(home, "providers.json"), "utf8")).keys;
+    const by = Object.fromEntries(doc.map((d) => [d.name, st[d.id]]));
+    assert.deepEqual([by.openrouter.status, by.openrouter.text], ["ok", "$5.50 credit"]);
+    assert.deepEqual([by.groq.status, by.groq.text], ["ok", "14.0k/14.4k requests today"]);
+    assert.ok(Math.abs(by.groq.resetsAt - Date.now() - 179560) < 15000, "refill time from the reset header");
+    assert.deepEqual([by.mistral.status, by.mistral.text], ["ok", "999.0M/1.0B tokens this month"]);
+    assert.ok(by.mistral.resetsAt > Date.now(), "month end");
+    assert.equal(by.aistudio.status, "ok");
+    assert.equal(by.cohere.status, "ok");
+    assert.deepEqual([by.together.status, by.together.text], ["invalid", "key rejected"]);
+    assert.equal(by.cloudflare.text, "token active");
+    assert.deepEqual([by.nvidia.status, by.nvidia.text], ["unchecked", "credits not reported"]);
+    assert.ok(!api.seen.some((s) => s.p.includes("nvidia")), "NVIDIA credits are never spent on a check");
+    assert.ok(api.seen.some((s) => s.auth === `Bearer ${k.groq}`), "each key goes to its own provider");
+    const table = spawnSync(process.execPath, [SCRIPT, "keys"], { env, encoding: "utf8" }).stdout;
+    assert.match(table, /groq\s+Groq\s+14\.0k\/14\.4k requests today\s+3m\s+ok/);
+    // widget data: names and numbers only
+    const snap = await childNode(`const p = require(${JSON.stringify(SCRIPT)}); console.log(JSON.stringify(p.providerSnapshot()))`, { CLAUDE_POOL_HOME: home });
+    for (const v of Object.values(k)) assert.ok(!snap.out.includes(v.slice(4, 24)), "a key reached the widget data");
+    assert.equal(JSON.parse(snap.out).show, true);
+    assert.equal(spawnSync(process.execPath, [SCRIPT, "keys", "hide"], { env }).status, 0);
+    assert.equal(JSON.parse((await childNode(`console.log(JSON.stringify(require(${JSON.stringify(SCRIPT)}).providerSnapshot()))`, { CLAUDE_POOL_HOME: home })).out).show, false);
+    // stored keys are redacted even without a known prefix, once loaded
+    const red = await childNode(`const p = require(${JSON.stringify(SCRIPT)}); p.providerSnapshot(); process.stdout.write(p.redact("x ${k.cohere} y"))`, { CLAUDE_POOL_HOME: home });
+    assert.ok(!red.out.includes(k.cohere.slice(0, 20)), red.out);
+  } finally {
+    api.server.close();
+  }
+});
+
+test("an exhausted free tier shows 'exhausted' with its refill time", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cpool-keysout-"));
+  const { text } = fakeKeyFile();
+  fs.writeFileSync(path.join(home, "k.txt"), text.split("\r\n")[1]); // the groq line only
+  const api = await providerMock({ groqOut: true });
+  try {
+    const env = { ...process.env, CLAUDE_POOL_HOME: home, CLAUDE_POOL_NO_SYSTEM: "1", CLAUDE_POOL_PROVIDER_BASE: api.url };
+    assert.equal((await runCpool(["keys", "import", path.join(home, "k.txt")], env)).status, 0);
+    const v = Object.values(JSON.parse(fs.readFileSync(path.join(home, "providers-state.json"), "utf8")).readings)[0];
+    assert.equal(v.status, "exhausted");
+    assert.ok(Math.abs(v.resetsAt - Date.now() - 3600000) < 15000);
+  } finally {
+    api.server.close();
+  }
+});
+
+test("wrong values are named, not just 'rejected': an org/key id instead of the secret, a plan with 0 requests/min", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cpool-keyshape-"));
+  fs.writeFileSync(path.join(home, "k.txt"), [`groq_api = "org_${rnd(26)}"`, `together_api = "key_${rnd(21)}"`, `mistral_api = "${rnd(32)}"`].join("\n"));
+  const api = await providerMock({ groq401: true, mistralZero: true });
+  try {
+    const env = { ...process.env, CLAUDE_POOL_HOME: home, CLAUDE_POOL_NO_SYSTEM: "1", CLAUDE_POOL_PROVIDER_BASE: api.url };
+    assert.equal((await runCpool(["keys", "import", path.join(home, "k.txt")], env)).status, 0);
+    const st = JSON.parse(fs.readFileSync(path.join(home, "providers-state.json"), "utf8")).readings;
+    const by = Object.fromEntries(JSON.parse(fs.readFileSync(path.join(home, "providers.json"), "utf8")).keys.map((d) => [d.name, st[d.id]]));
+    assert.deepEqual([by.groq.status, by.groq.text], ["invalid", "looks like an ID (org_...), not the secret key"]);
+    assert.deepEqual([by.together.status, by.together.text], ["invalid", "looks like an ID (key_...), not the secret key"]);
+    assert.deepEqual([by.mistral.status, by.mistral.text], ["exhausted", "plan allows 0 requests/min (no access)"]);
+  } finally {
+    api.server.close();
+  }
+});
+
+test("widget shows the Other AI section (left, refill, status) and hides it when switched off", { skip: process.platform !== "win32" }, () => {
+  const now = Date.now();
+  const { acc, st } = samplePool(now);
+  const snap = pool.buildSnapshot(acc, st, now);
+  snap.daemon = { pid: 1 };
+  snap.others = { show: true, rows: [
+    { name: "groq", provider: "Groq", text: "14.0k/14.4k requests today", status: "ok", pct: 97, reset: "3m" },
+    { name: "gem", provider: "Gemini", text: "daily request limit reached", status: "exhausted", pct: 0, reset: "6h" },
+    { name: "tog", provider: "Together", text: "key rejected", status: "invalid", pct: null, reset: "" },
+  ] };
+  const r = widgetSelfTest(snap);
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /Other AI\|Left\|Refill\|Status\|groq\|Groq\|14\.0k\/14\.4k requests today\|3m\|ok\|gem\|Gemini\|daily request limit reached\|6h\|exhausted\|tog\|Together\|key rejected\|\|invalid key/);
+  snap.others.show = false;
+  assert.doesNotMatch(widgetSelfTest(snap).out, /Other AI/);
+});
+
 // ---------------------------------------------------------------- auto hi + placeholder text
 test("auto hi: due 5 s after a 5h reset, once per reset, retry respected, never for weekly-exhausted / dead / not-logged-in", () => {
   const { acc, st } = samplePool();

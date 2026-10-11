@@ -194,6 +194,34 @@ Setup tokens are valid for about a year. When one stops working, the account sho
 with the wrong account), right-click the widget → **Re-login account** → the account, or run `cpool login <name>`.
 The new token replaces the old one.
 
+## Other AI providers (API keys)
+
+The widget can also show your other AI keys - free tiers included - under the Claude accounts: what is left, when it
+refills, and whether the key is ok, low, exhausted or invalid.
+
+```bat
+cpool keys import keys.txt     :: lines like  groq_api = "gsk_..."  or  OPENROUTER_API_KEY=sk-or-v1-...
+cpool keys                     :: table: key, provider, left, refill, status
+cpool keys check               :: check them all now (the daemon does it every 30 min and on Refresh)
+cpool keys add <name>          :: add one (asked for, hidden)  -  remove | on | off <name>  -  show | hide (widget)
+```
+
+Each provider is checked with the cheapest call that returns something real, never a guess:
+
+| Provider | What is shown | How |
+|---|---|---|
+| OpenRouter | credit left / key limit left | free account endpoints |
+| Groq | requests left today + refill time | rate-limit headers of a 1-token request (free tier) |
+| Mistral | tokens left this month, or "plan allows 0 requests/min" | rate-limit headers of a 1-token request |
+| DeepSeek | balance | free balance endpoint |
+| Gemini, Cohere, Together, Cloudflare, Hugging Face, Replicate, OpenAI | key works / rejected / out of credit / rate limited | free key check (these report no quota) |
+| NVIDIA | not checked | its free credits can only be read by spending one |
+
+A rejected value that looks like an ID (`org_...`, `key_...`) is called out as "an ID, not the secret key". Keys are
+stored in `providers.json` in the owner-only pool folder. Each key is sent only to its own provider, and keys never
+appear in output, logs or the widget data: stored values are redacted even when their format has no recognisable
+prefix. Right-click the widget → **Show other AI keys** to show or hide the section.
+
 ## Auto hi at every 5h reset
 
 A Claude 5-hour window starts with the first message after the previous window ended. claude-pool tracks every
@@ -272,6 +300,7 @@ Whichever starts first runs the daemon; the other sees it running and exits. `cp
 | `cpool background [on\|off]` | Windows: daemon (2 min) + widget, hidden, now and at every logon; no argument = status |
 | `cpool widget [stop]` | Show / close the desktop widget |
 | `cpool autohi [on\|off]` | Auto hi at every 5h reset (default on) |
+| `cpool keys [check \| import <file> \| add <name> \| remove\|on\|off <name> \| show\|hide]` | Other AI providers' API keys: what is left, refill time, status (also on the widget) |
 | `cpool shim [on\|off]` | Windows: plain `claude` in new terminals starts a pool session (non-session commands pass through); no argument = status |
 | `cpool install` | Copy to `~/.claude-pool`, write the `cpool` / `claude-p` shims, add them to PATH |
 | `cpool help` / `version` | Usage / version |
@@ -301,6 +330,7 @@ Everything lives in `~/.claude-pool` (`%USERPROFILE%\.claude-pool`):
 | `state.json` | Shared limit cache, live `cpool` sessions, current default account |
 | `snapshot.json` | What the widget shows: names and numbers only, **no tokens** |
 | `login.json`, `login.queue`, `autohi.json` | Login progress, queued widget logins, last auto hi |
+| `providers.json`, `providers-state.json` | Other AI keys (owner-only) and their last check results (no keys) |
 | `cli-usage.json` | 5h / 7d usage of the `claude /login` account (for the Logins line; no token) |
 | `widget.ps1`, `widget.vbs`, `background.vbs`, `widget-prefs.json` | Widget script (rewritten on start), hidden launchers, position / background |
 | `cpool-helper-*.exe` / `.cs` | The login helper and its source |

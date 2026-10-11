@@ -16,6 +16,7 @@ Use it when Claude Code keeps stopping with "usage limit reached" and you have m
 - Install: `node claude-pool.js install` (writes the `cpool` command), then `cpool background on` on Windows
 - Run Claude Code with live account switching: `cpool [any claude arguments]`, or `cpool shim on` (Windows) so plain `claude` does the same
 - See all limits: `cpool limits`
+- Other AI API keys (OpenRouter, Groq, Mistral, Gemini, Cohere, Together, Cloudflare, Hugging Face, Replicate, NVIDIA, OpenAI, DeepSeek): `cpool keys import <file>`, `cpool keys` - credit / requests / tokens left, refill time, ok / exhausted / invalid, also on the widget
 - Add an account: widget "Log in" / "+ Add account", or `cpool login <name>`, or `claude setup-token` + `cpool add <name>`
 - Limits are read from the `anthropic-ratelimit-unified-{5h,7d}-{utilization,reset}` headers of a 1-token Haiku request
 - Tokens live in `~/.claude-pool/accounts.json` (owner-only), are never printed, and never appear in the widget data

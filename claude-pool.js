@@ -55,6 +55,11 @@ COMMANDS
                                    claude.exe first on the user PATH). Sessions switch accounts on limits;
                                    subcommands, -p, --bg, --version, --help go straight to the real claude.
                                    No argument = status.
+  cpool keys                       other AI providers' API keys (OpenRouter, Groq, Mistral, Gemini, Cohere,
+                                   Together, Cloudflare, Hugging Face, Replicate, NVIDIA, OpenAI, DeepSeek): what is
+                                   left, when it refills, ok / low / exhausted / invalid - shown on the widget too.
+  cpool keys import <file>         add keys from a file (lines like  groq_api = "..."  or  OPENAI_API_KEY=...)
+  cpool keys add <name> [--provider p] | remove|on|off <name> | check | show|hide (widget section)
   cpool autohi [on|off]            auto hi (default on, part of the daemon): the moment an account's 5h window
                                    resets, send it a 1-token "hi" so the next window starts at once - 24/7 while
                                    the PC is awake. CLAUDE_POOL_AUTO_HI=0 also turns it off.
@@ -108,7 +113,7 @@ const PROBE_INFLIGHT_MS = 25000;
 const UA = "claude-code/2.1.293";
 const PROBE_MODEL = "claude-haiku-5-5";
 const DEFAULT_CONTINUE_PROMPT = "continue where you left off";
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 // daemon + desktop widget
 const SNAPSHOT_FILE = path.join(HOME, "snapshot.json");
 const REFRESH_FLAG = path.join(HOME, "refresh.flag");
@@ -138,7 +143,15 @@ const HI_RETRY_MS = 60000; // window not reset yet / network trouble: try again 
 const autoHiOn = () => process.env.CLAUDE_POOL_AUTO_HI !== "0" && !fs.existsSync(AUTO_HI_OFF);
 
 // ---------------------------------------------------------------- output (always redacted)
-const redact = (s) => String(s).replace(TOKEN_RE_G, (m) => "sk-ant-...." + m.slice(-4));
+// Every printed / logged line goes through this. Claude tokens, the API-key formats of the other providers, and the
+// exact value of every stored provider key (some formats have no recognisable prefix) are cut to their last 4.
+const SECRET_RE_G = /sk-ant-[A-Za-z0-9]{3,6}-[A-Za-z0-9_\-]{20,}|sk-or-v1-[A-Za-z0-9]{20,}|sk-proj-[A-Za-z0-9_\-]{20,}|sk-[A-Za-z0-9]{32,}|gsk_[A-Za-z0-9]{20,}|hf_[A-Za-z0-9]{20,}|r8_[A-Za-z0-9]{20,}|nvapi-[A-Za-z0-9_\-]{20,}|AIza[0-9A-Za-z_\-]{30,}|AQ\.[A-Za-z0-9_\-]{20,}|xai-[A-Za-z0-9]{20,}|pplx-[A-Za-z0-9]{20,}/g;
+const knownSecrets = new Set();
+const redact = (s) => {
+  let t = String(s).replace(SECRET_RE_G, (m) => m.slice(0, Math.min(7, m.indexOf("-") + 1 || 4)) + "...." + m.slice(-4));
+  for (const k of knownSecrets) if (k.length >= 12 && t.includes(k)) t = t.split(k).join("...." + k.slice(-4));
+  return t;
+};
 const out = (s = "") => process.stdout.write(redact(s) + "\n");
 const err = (s = "") => process.stderr.write(redact(s) + "\n");
 const tail = (t) => (t ? "..." + String(t).slice(-4) : "----");
@@ -1134,6 +1147,11 @@ async function cmdLimits() {
   }
   const snap = buildSnapshot(loadAccounts(), liveState(loadState()), Date.now(), null, [], { on: autoHiOn(), last: readJson(AUTO_HI_LAST, () => null) }, cli);
   for (const l of summaryLines(snap)) out(l);
+  const others = providerSnapshot();
+  if (others.rows.length) {
+    out("");
+    out(table(others.rows.map((r) => [r.name, r.provider, r.text, r.reset, r.status]), ["Other AI", "Provider", "Left", "Refill", "Status"]));
+  }
   return 0;
 }
 
@@ -1331,6 +1349,7 @@ function writeSnapshot(daemon) {
     on: autoHiOn(),
     last: readJson(AUTO_HI_LAST, () => null),
   }, cliInfo());
+  snap.others = providerSnapshot();
   snap.daemon = daemon || null;
   writeJsonAtomic(SNAPSHOT_FILE, snap);
   return snap;
@@ -1640,7 +1659,7 @@ async function cmdDaemon(args = []) {
       log(`snapshot error: ${e.message}`);
     }
   }, SNAPSHOT_EVERY_MS);
-  let sig = null, nextProbe = 0, nextWidget = 0, loginBusy = false, nextCli = 0;
+  let sig = null, nextProbe = 0, nextWidget = 0, loginBusy = false, nextCli = 0, nextProviders = 0;
   const hiDone = {}, hiBusy = new Set();
   const snapNow = () => {
     try {
@@ -1676,6 +1695,12 @@ async function cmdDaemon(args = []) {
         }
       }
       const force = takeFlag(REFRESH_FLAG);
+      if ((force || Date.now() >= nextProviders) && fs.existsSync(PROVIDERS_FILE)) {
+        nextProviders = Date.now() + PROVIDER_EVERY_MS; // other AI keys: every 30 min and on Refresh
+        checkProviders()
+          .then(() => snapNow())
+          .catch((e) => log(`providers check error: ${e.message}`));
+      }
       if (force || Date.now() >= nextProbe || accountsSig() !== sig) {
         try {
           await daemonCycle(force);
@@ -1792,6 +1817,290 @@ function cmdInstall() {
   lockDown();
   out("[pool] next: on each subscription run `claude setup-token`, then `cpool add acct1` ... `cpool limits`, then `cpool`");
   if (IS_WIN) out("[pool] background daemon + desktop widget (now and at every logon): cpool background on");
+  return 0;
+}
+
+// ---------------------------------------------------------------- other AI providers (API keys)
+// Free / paid API keys of other AI services, shown under the Claude accounts. Each is checked with the cheapest call
+// that says something real: a free account endpoint where the provider has one (OpenRouter credit), the rate-limit
+// headers of a 1-token request where those carry the quota (Groq requests per day, Mistral tokens per month), and a
+// free key check where the provider reports no quota at all - never a guess. Keys live in providers.json (owner-only
+// folder) and never reach output, logs or the widget data.
+const PROVIDERS_FILE = path.join(HOME, "providers.json");
+const PROVIDERS_STATE = path.join(HOME, "providers-state.json");
+const PROVIDERS_HIDDEN = path.join(HOME, "providers.hidden");
+const PROVIDER_EVERY_MS = Math.max(60000, num(process.env.CLAUDE_POOL_PROVIDER_EVERY_MS, 30 * 60000));
+const PROVIDER_BASE = (process.env.CLAUDE_POOL_PROVIDER_BASE || "").replace(/\/+$/, ""); // tests: every provider -> one mock
+const PROVIDER_KINDS = {
+  openrouter: { label: "OpenRouter", key: /^sk-or-v1-/, name: /openrouter/ },
+  groq: { label: "Groq", key: /^gsk_/, name: /groq/ },
+  mistral: { label: "Mistral", name: /mistral/ },
+  gemini: { label: "Gemini", key: /^(AIza|AQ\.)/, name: /gemini|aistudio|google/ },
+  cohere: { label: "Cohere", name: /cohere/ },
+  together: { label: "Together", name: /together/ },
+  cloudflare: { label: "Cloudflare", name: /cloudflare/ },
+  huggingface: { label: "Hugging Face", key: /^hf_/, name: /hugging|^hf\b/ },
+  replicate: { label: "Replicate", key: /^r8_/, name: /replicate/ },
+  nvidia: { label: "NVIDIA", key: /^nvapi-/, name: /nvidia/ },
+  openai: { label: "OpenAI", key: /^sk-proj-/, name: /openai/ },
+  deepseek: { label: "DeepSeek", name: /deepseek/ },
+};
+function detectProvider(label, value) {
+  for (const [id, k] of Object.entries(PROVIDER_KINDS)) if (k.key && k.key.test(value)) return id;
+  const l = String(label || "").toLowerCase();
+  for (const [id, k] of Object.entries(PROVIDER_KINDS)) if (k.name.test(l)) return id;
+  return "other";
+}
+// "name = "value"", "NAME=value", "name: value" or a bare key per line
+function parseKeyFile(text) {
+  const out = [];
+  for (const raw of String(text).replace(/^\ufeff/, "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#") || line.startsWith("//")) continue;
+    const m = line.match(/^([A-Za-z0-9_.\- ]{1,60}?)\s*[:=]\s*["']?([^"'\s]+)["']?\s*;?$/);
+    const label = m ? m[1].trim() : "";
+    const value = m ? m[2] : line.replace(/^["']|["']$/g, "");
+    if (!value || value.length < 16 || /\s/.test(value)) continue;
+    out.push({ label, value, provider: detectProvider(label, value) });
+  }
+  return out;
+}
+function loadProviders() {
+  const d = readJson(PROVIDERS_FILE, () => ({ version: 1, keys: [] }), { strict: true });
+  const keys = Array.isArray(d.keys) ? d.keys : [];
+  for (const k of keys) if (k.key) knownSecrets.add(k.key);
+  return { version: 1, keys };
+}
+function saveProviders(doc) {
+  ensureHome();
+  writeJsonAtomic(PROVIDERS_FILE, doc);
+  lockDown();
+}
+const providerName = (label, provider) =>
+  (String(label || "").toLowerCase().replace(/[_\-\s]*(api[_\-\s]*key|api[_\-\s]*token|api|key|token)[_\-\s]*$/, "").replace(/[_\-\s]+$/, "") || provider).slice(0, 24);
+
+// --- the checks (each returns { at, status, text, pct, resetsAt }) ---
+// status: ok | low | exhausted | invalid | error | unchecked
+const preading = (status, text, extra = {}) => ({ at: Date.now(), status, text, pct: null, resetsAt: null, ...extra });
+const providerUrl = (u) => (PROVIDER_BASE ? PROVIDER_BASE + new URL(u).pathname + new URL(u).search : u);
+async function httpJson(url, opts = {}) {
+  const r = await fetch(providerUrl(url), { ...opts, signal: AbortSignal.timeout(20000) });
+  const text = await r.text().catch(() => "");
+  let body = null;
+  try {
+    body = JSON.parse(text);
+  } catch {}
+  return { r, body };
+}
+// "2m59.56s", "7.66s", "1h2m3s", "120ms", or plain seconds
+function durMs(s) {
+  if (s == null || s === "") return null;
+  if (isFinite(Number(s))) return Number(s) * 1000;
+  let ms = 0, any = false;
+  for (const m of String(s).matchAll(/(\d+(?:\.\d+)?)(ms|h|m|s)/g)) {
+    any = true;
+    const v = parseFloat(m[1]);
+    ms += m[2] === "h" ? v * 3600000 : m[2] === "m" ? v * 60000 : m[2] === "s" ? v * 1000 : v;
+  }
+  return any ? ms : null;
+}
+const fmtNum = (n) =>
+  n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e5 ? Math.round(n / 1e3) + "k" : n >= 1e4 ? (n / 1e3).toFixed(1) + "k" : String(Math.round(n));
+const level = (pct) => (pct <= 0 ? "exhausted" : pct <= 10 ? "low" : "ok");
+const errText = (r, body) => `HTTP ${r.status}${body && (body.error || body.message) ? " " + String((body.error && (body.error.message || body.error)) || body.message).slice(0, 60) : ""}`;
+const bearer = (key) => ({ Authorization: `Bearer ${key}`, "content-type": "application/json" });
+const oneToken = (model) => JSON.stringify({ model, messages: [{ role: "user", content: "hi" }], max_tokens: 1 });
+// a key check where the provider reports no quota: works / rejected / out of credit
+async function keyCheck(url, headers, worksText) {
+  const { r, body } = await httpJson(url, { headers });
+  if (r.status === 401 || r.status === 403) return preading("invalid", "key rejected");
+  if (r.status === 402) return preading("exhausted", "out of credit");
+  if (r.status === 429) return preading("exhausted", "rate limited", { resetsAt: durMs(r.headers.get("retry-after")) ? Date.now() + durMs(r.headers.get("retry-after")) : null });
+  if (!r.ok) return preading("error", errText(r, body));
+  return preading("ok", worksText);
+}
+const PROBES = {
+  async openrouter(key) {
+    const { r, body } = await httpJson("https://openrouter.ai/api/v1/key", { headers: bearer(key) });
+    if (r.status === 401 || r.status === 403) return preading("invalid", "key rejected");
+    const d = body && body.data;
+    if (!r.ok || !d) return preading("error", errText(r, body));
+    if (d.limit != null && Number(d.limit) > 0) {
+      const left = Number(d.limit_remaining != null ? d.limit_remaining : d.limit - d.usage);
+      const pct = (left / Number(d.limit)) * 100;
+      return preading(level(pct), `$${left.toFixed(2)} of $${Number(d.limit).toFixed(2)} left`, { pct });
+    }
+    const c = await httpJson("https://openrouter.ai/api/v1/credits", { headers: bearer(key) }).catch(() => null);
+    const cd = c && c.body && c.body.data;
+    if (cd) {
+      const bal = Number(cd.total_credits) - Number(cd.total_usage);
+      if (bal > 0) return preading("ok", `$${bal.toFixed(2)} credit`);
+      return preading("ok", "free models only (no credit)");
+    }
+    return preading("ok", d.is_free_tier ? "free tier" : `$${Number(d.usage || 0).toFixed(2)} used`);
+  },
+  async groq(key) {
+    const { r, body } = await httpJson("https://api.groq.com/openai/v1/chat/completions", { method: "POST", headers: bearer(key), body: oneToken("llama-3.1-8b-instant") });
+    const h = (k) => r.headers.get(k);
+    const lim = Number(h("x-ratelimit-limit-requests")), rem = Number(h("x-ratelimit-remaining-requests")), reset = durMs(h("x-ratelimit-reset-requests"));
+    if (r.status === 401) return preading("invalid", "key rejected");
+    if (r.status === 429) return preading("exhausted", "daily request limit reached", { pct: 0, resetsAt: Date.now() + (reset || durMs(h("retry-after")) || 60000) });
+    if (!r.ok) return preading("error", errText(r, body));
+    if (lim > 0) return preading(level((rem / lim) * 100), `${fmtNum(rem)}/${fmtNum(lim)} requests today`, { pct: (rem / lim) * 100, resetsAt: reset != null ? Date.now() + reset : null });
+    return preading("ok", "key works");
+  },
+  async mistral(key) {
+    const { r, body } = await httpJson("https://api.mistral.ai/v1/chat/completions", { method: "POST", headers: bearer(key), body: oneToken("mistral-small-latest") });
+    const h = (k) => r.headers.get(k);
+    if (r.status === 401) return preading("invalid", "key rejected");
+    const now = new Date();
+    const monthEnd = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+    // a limit of 0 requests/minute is not "busy": the key's plan allows no requests at all (e.g. not activated)
+    if (r.status === 429 && h("x-ratelimit-limit-req-minute") === "0") return preading("exhausted", "plan allows 0 requests/min (no access)", { pct: 0 });
+    if (r.status === 429) return preading("exhausted", "rate limit reached", { pct: 0, resetsAt: durMs(h("retry-after")) ? Date.now() + durMs(h("retry-after")) : null });
+    if (!r.ok) return preading("error", errText(r, body));
+    const lim = Number(h("x-ratelimit-limit-tokens-month")), rem = Number(h("x-ratelimit-remaining-tokens-month"));
+    if (lim > 0) return preading(level((rem / lim) * 100), `${fmtNum(rem)}/${fmtNum(lim)} tokens this month`, { pct: (rem / lim) * 100, resetsAt: monthEnd });
+    return preading("ok", "key works");
+  },
+  gemini: (key) => keyCheck("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1", { "x-goog-api-key": key }, "free tier (quota not reported)"),
+  async cohere(key) {
+    const { r, body } = await httpJson("https://api.cohere.com/v1/check-api-key", { method: "POST", headers: bearer(key) });
+    if (r.status === 401 || (body && body.valid === false)) return preading("invalid", "key rejected");
+    if (!r.ok) return preading("error", errText(r, body));
+    return preading("ok", "trial key (calls not reported)");
+  },
+  together: (key) => keyCheck("https://api.together.xyz/v1/models", bearer(key), "key works (credit not reported)"),
+  async cloudflare(key) {
+    const { r, body } = await httpJson("https://api.cloudflare.com/client/v4/user/tokens/verify", { headers: bearer(key) });
+    const res = body && body.result;
+    if (r.status === 401 || r.status === 403 || (res && res.status && res.status !== "active")) return preading("invalid", res && res.status ? `token ${res.status}` : "token rejected");
+    if (!r.ok) return preading("error", errText(r, body));
+    return preading("ok", res && res.expires_on ? `token active (expires ${String(res.expires_on).slice(0, 10)})` : "token active");
+  },
+  huggingface: (key) => keyCheck("https://huggingface.co/api/whoami-v2", bearer(key), "key works (credit not reported)"),
+  replicate: (key) => keyCheck("https://api.replicate.com/v1/account", bearer(key), "key works (credit not reported)"),
+  openai: (key) => keyCheck("https://api.openai.com/v1/models", bearer(key), "key works (credit not reported)"),
+  async deepseek(key) {
+    const { r, body } = await httpJson("https://api.deepseek.com/user/balance", { headers: bearer(key) });
+    if (r.status === 401) return preading("invalid", "key rejected");
+    if (!r.ok || !body) return preading("error", errText(r, body));
+    const b = (body.balance_infos || [])[0];
+    return b ? preading(Number(b.total_balance) > 0 ? "ok" : "exhausted", `${b.total_balance} ${b.currency} balance`) : preading("ok", "key works");
+  },
+  // NVIDIA's free credits are only visible by spending one: not checked
+  nvidia: async () => preading("unchecked", "credits not reported"),
+};
+async function probeProvider(entry) {
+  const fn = PROBES[entry.provider];
+  if (!fn) return preading("unchecked", "no check for this provider");
+  try {
+    const v = await fn(entry.key);
+    // a rejected value shaped like an account / org / key id was pasted instead of the secret key
+    if (v.status === "invalid" && /^(org|key|acct|proj|user)[_-]/i.test(entry.key)) v.text = `looks like an ID (${entry.key.slice(0, 4)}...), not the secret key`;
+    else if (v.status === "invalid" && entry.provider === "groq" && !/^gsk_/.test(entry.key)) v.text = "not a Groq API key (those start with gsk_)";
+    v.text = redact(v.text);
+    return v;
+  } catch (e) {
+    return preading("error", redact(String((e && e.message) || e)).slice(0, 80));
+  }
+}
+let providersBusy = false;
+async function checkProviders() {
+  if (providersBusy) return null;
+  providersBusy = true;
+  try {
+    const keys = loadProviders().keys.filter((k) => k.enabled !== false);
+    const readings = {};
+    await Promise.all(keys.map(async (k) => (readings[k.id] = await probeProvider(k))));
+    const prev = readJson(PROVIDERS_STATE, () => ({ readings: {} }));
+    writeJsonAtomic(PROVIDERS_STATE, { readings: { ...prev.readings, ...readings } });
+    return readings;
+  } finally {
+    providersBusy = false;
+  }
+}
+// widget / limits rows - names, providers and numbers only
+function providerSnapshot(now = Date.now(), doc = null, readings = null) {
+  let keys = [];
+  try {
+    keys = (doc || loadProviders()).keys;
+  } catch {
+    return { show: false, rows: [], error: "providers.json cannot be read" };
+  }
+  const rd = readings || readJson(PROVIDERS_STATE, () => ({ readings: {} })).readings || {};
+  const rows = keys.map((k) => {
+    const v = k.enabled === false ? null : rd[k.id];
+    return {
+      name: k.name,
+      provider: (PROVIDER_KINDS[k.provider] || { label: k.provider }).label,
+      text: k.enabled === false ? "off" : v ? v.text : "not checked yet",
+      status: k.enabled === false ? "off" : v ? v.status : "pending",
+      pct: v && v.pct != null ? Math.round(v.pct) : null,
+      reset: v && v.resetsAt && v.resetsAt > now ? fmtShort(v.resetsAt - now) : "",
+    };
+  });
+  return { show: rows.length > 0 && !fs.existsSync(PROVIDERS_HIDDEN), rows };
+}
+async function cmdKeys(args) {
+  const [sub, ...rest] = args;
+  if (sub === "import") {
+    const file = rest[0];
+    if (!file || !fs.existsSync(file)) return err("usage: cpool keys import <file>   (lines like  groq_api = \"...\"  or  OPENAI_API_KEY=...)"), 2;
+    const found = parseKeyFile(fs.readFileSync(file, "utf8"));
+    const doc = loadProviders();
+    let added = 0;
+    for (const f of found) {
+      knownSecrets.add(f.value);
+      if (doc.keys.some((k) => k.key === f.value)) continue;
+      let name = providerName(f.label, f.provider);
+      for (let i = 2; doc.keys.some((k) => k.name === name); i++) name = `${providerName(f.label, f.provider)}${i}`;
+      doc.keys.push({ id: newId(), name, provider: f.provider, key: f.value, enabled: true, addedAt: new Date().toISOString() });
+      added++;
+      out(`[pool] ${name.padEnd(14)} ${(PROVIDER_KINDS[f.provider] || { label: f.provider }).label.padEnd(13)} ${tail(f.value)}`);
+    }
+    saveProviders(doc);
+    takeFlag(PROVIDERS_HIDDEN);
+    out(`[pool] imported ${added} new key${added === 1 ? "" : "s"} (${found.length - added} already there). Checking them...`);
+    await checkProviders();
+    return cmdKeys([]);
+  }
+  if (sub === "add") {
+    const flags = parseFlags(rest, ["--provider"]);
+    const name = flags._[0];
+    if (!name) return err("usage: cpool keys add <name> [--provider groq|openrouter|...]   (the key is asked for, hidden)"), 2;
+    const key = (await promptHidden(`API key for ${name} (input hidden): `)).trim();
+    if (key.length < 16) return err("[pool] that does not look like an API key"), 2;
+    knownSecrets.add(key);
+    const doc = loadProviders();
+    if (doc.keys.some((k) => k.key === key)) return err("[pool] that key is already saved"), 2;
+    const provider = flags["--provider"] || detectProvider(name, key);
+    doc.keys.push({ id: newId(), name: String(name).slice(0, 24), provider, key, enabled: true, addedAt: new Date().toISOString() });
+    saveProviders(doc);
+    out(`[pool] added ${name} (${(PROVIDER_KINDS[provider] || { label: provider }).label}, ${tail(key)})`);
+    await checkProviders();
+    return cmdKeys([]);
+  }
+  if (sub === "remove" || sub === "on" || sub === "off") {
+    const doc = loadProviders();
+    const k = doc.keys.find((x) => x.name.toLowerCase() === String(rest[0] || "").toLowerCase());
+    if (!k) return err(`[pool] no key named "${rest[0] || ""}"`), 2;
+    if (sub === "remove") doc.keys.splice(doc.keys.indexOf(k), 1);
+    else k.enabled = sub === "on";
+    saveProviders(doc);
+    return out(`[pool] ${k.name}: ${sub === "remove" ? "removed" : sub}`), 0;
+  }
+  if (sub === "show" || sub === "hide") {
+    if (sub === "hide") fs.writeFileSync(PROVIDERS_HIDDEN, "");
+    else takeFlag(PROVIDERS_HIDDEN);
+    return out(`[pool] other AI keys are ${sub === "hide" ? "hidden on" : "shown on"} the widget`), 0;
+  }
+  if (sub === "check") await checkProviders();
+  else if (sub) return err("usage: cpool keys [check | import <file> | add <name> | remove|on|off <name> | show|hide]"), 2;
+  const s = providerSnapshot();
+  if (!s.rows.length) return out("no API keys yet: cpool keys import <file>  or  cpool keys add <name>"), 0;
+  out(table(s.rows.map((r) => [r.name, r.provider, r.text, r.reset, r.status]), ["Key", "Provider", "Left", "Refill", "Status"]));
+  out(`\nwidget: ${s.show ? "shown" : "hidden (cpool keys show)"} \u00b7 checked every ${PROVIDER_EVERY_MS / 60000} min by the daemon`);
   return 0;
 }
 
@@ -2552,6 +2861,7 @@ Add-Type -Namespace ClaudePool -Name Native -MemberDefinition @'
       <StackPanel.Effect><DropShadowEffect ShadowDepth="0" BlurRadius="4" Opacity="0.6" Color="Black"/></StackPanel.Effect>
       <Grid x:Name="Table"/>
       <Grid x:Name="Summary" Margin="0,8,0,0"/>
+      <Grid x:Name="Others" Margin="0,10,0,0" Visibility="Collapsed"/>
       <StackPanel x:Name="Actions" Orientation="Horizontal" Margin="0,9,0,0" Visibility="Collapsed"/>
       <TextBlock x:Name="Foot" Margin="0,6,0,0" FontSize="11" Visibility="Collapsed" TextWrapping="Wrap" MaxWidth="560" HorizontalAlignment="Left"/>
     </StackPanel>
@@ -2560,7 +2870,7 @@ Add-Type -Namespace ClaudePool -Name Native -MemberDefinition @'
 '@
 $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xaml))
 $Card = $win.FindName('Card'); $Body = $win.FindName('Body'); $Table = $win.FindName('Table')
-$Summary = $win.FindName('Summary'); $Foot = $win.FindName('Foot'); $Actions = $win.FindName('Actions')
+$Summary = $win.FindName('Summary'); $Foot = $win.FindName('Foot'); $Actions = $win.FindName('Actions'); $Others = $win.FindName('Others')
 
 $conv = New-Object Windows.Media.BrushConverter
 function New-Brush([string]$hex) { $b = $conv.ConvertFromString($hex); $b.Freeze(); return $b }
@@ -2584,6 +2894,33 @@ function Save-Prefs { try { ($Prefs | ConvertTo-Json -Compress) | Set-Content -P
 
 foreach ($i in 1..7) { $c = New-Object Windows.Controls.ColumnDefinition; $c.Width = [Windows.GridLength]::Auto; [void]$Table.ColumnDefinitions.Add($c) }
 foreach ($i in 1..2) { $c = New-Object Windows.Controls.ColumnDefinition; $c.Width = [Windows.GridLength]::Auto; [void]$Summary.ColumnDefinitions.Add($c) }
+foreach ($i in 1..5) { $c = New-Object Windows.Controls.ColumnDefinition; $c.Width = [Windows.GridLength]::Auto; [void]$Others.ColumnDefinitions.Add($c) }
+# other AI keys: status word + colour (the numbers come ready-made from the daemon)
+$OtherStatus = @{ ok = 'ok'; low = 'low'; exhausted = 'exhausted'; invalid = 'invalid key'; error = 'check failed'; unchecked = 'not reported'; pending = 'checking'; off = 'off' }
+function Add-Others($snap) {
+  $o = $snap.others
+  $rows = if ($o) { @($o.rows | Where-Object { $_ }) } else { @() }
+  if (-not $o -or -not $o.show -or $rows.Count -eq 0) { $Others.Visibility = 'Collapsed'; return }
+  $Others.Visibility = 'Visible'
+  Reset-Rows $Others ($rows.Count + 1)
+  Add-Text $Others 0 0 'Other AI' $Muted
+  Add-Text $Others 0 2 'Left' $Muted 14
+  Add-Text $Others 0 3 'Refill' $Muted 12
+  Add-Text $Others 0 4 'Status' $Muted 14
+  $i = 1
+  foreach ($r in $rows) {
+    $bad = @('exhausted', 'invalid') -contains $r.status
+    $quiet = @('off', 'pending', 'unchecked', 'error') -contains $r.status
+    Add-Text $Others $i 0 ([string]$r.name) $(if ($quiet) { $Muted } else { $Fg })
+    Add-Text $Others $i 1 ([string]$r.provider) $Muted 10
+    $leftBrush = if ($bad) { $Low } elseif ($null -ne $r.pct) { Pct-Brush $r.pct $false } elseif ($quiet) { $Muted } else { $Fg }
+    Add-Text $Others $i 2 ([string]$r.text) $leftBrush 14
+    Add-Text $Others $i 3 ([string]$r.reset) $Muted 12
+    $word = if ($OtherStatus.ContainsKey([string]$r.status)) { $OtherStatus[[string]$r.status] } else { [string]$r.status }
+    Add-Text $Others $i 4 $word $(if ($bad) { $Low } elseif ($r.status -eq 'low') { $Mid } else { $Muted }) 14
+    $i++
+  }
+}
 
 function Reset-Rows($grid, [int]$n) {
   $grid.Children.Clear(); $grid.RowDefinitions.Clear()
@@ -2727,6 +3064,8 @@ function Render {
     Add-Text $Summary 2 1 ([string]$snap.resets.d7) $Fg 12
   }
 
+  if ($snap) { Add-Others $snap } else { $Others.Visibility = 'Collapsed' }
+
   # buttons only while something needs doing; Add account stays in the right-click menu otherwise
   $Actions.Children.Clear()
   $need = if ($snap) { [int]$snap.needLogin } else { 0 }
@@ -2841,7 +3180,11 @@ $AutoHiOff = Join-Path $StateDir 'autohi.off'
 $script:HiItem = Add-MenuItem 'Auto hi at every 5h reset' {
   try { if (Test-Path $AutoHiOff) { Remove-Item $AutoHiOff } else { Set-Content -Path $AutoHiOff -Value '' } } catch {}
 }
-$menu.Add_Opened({ $script:HiItem.IsChecked = -not (Test-Path $AutoHiOff); Fill-ReloginMenu })
+$OthersHidden = Join-Path $StateDir 'providers.hidden'
+$script:OthersItem = Add-MenuItem 'Show other AI keys' {
+  try { if (Test-Path $OthersHidden) { Remove-Item $OthersHidden } else { Set-Content -Path $OthersHidden -Value '' } } catch {}
+}
+$menu.Add_Opened({ $script:HiItem.IsChecked = -not (Test-Path $AutoHiOff); $script:OthersItem.IsChecked = -not (Test-Path $OthersHidden); Fill-ReloginMenu })
 $script:BgItem = Add-MenuItem 'Background' { $Prefs.bg = ([int]$Prefs.bg + 1) % 3; Apply-Background; Save-Prefs }
 $script:LockItem = Add-MenuItem 'Lock position' { $Prefs.locked = -not $Prefs.locked; $script:LockItem.IsChecked = [bool]$Prefs.locked; Save-Prefs }
 $script:LockItem.IsChecked = [bool]$Prefs.locked
@@ -2864,7 +3207,7 @@ if ($SelfTest) {   # render snapshot.json once without showing a window; print t
       if ($el -is [Windows.Controls.Button]) { return '[' + $el.Content + ']' }
       if ($el -is [Windows.Controls.Panel]) { foreach ($c in $el.Children) { Get-Drawn $c } }
     }
-    $drawn = foreach ($el in @($Table.Children) + @($Summary.Children) + @($Actions.Children)) { Get-Drawn $el }
+    $drawn = foreach ($el in @($Table.Children) + @($Summary.Children) + @($Others.Children) + @($Actions.Children)) { Get-Drawn $el }
     'DRAWN=' + ($drawn -join '|')
     'FOOT=' + $Foot.Text
     Fill-ReloginMenu
@@ -2930,6 +3273,7 @@ const COMMANDS = {
   bg: (a) => cmdBackground(a[0]),
   widget: (a) => cmdWidget(a[0]),
   autohi: (a) => cmdAutoHi(a[0]),
+  keys: (a) => cmdKeys(a),
   shim: (a) => cmdShim(a[0]),
   "shim-run": (a) => cmdShimRun(a),
   install: () => cmdInstall(),
@@ -2958,6 +3302,7 @@ module.exports = {
   tokenFromScreen, ensureHelper, readLoginQueue, dueHis, matchCliAccount, fetchCliUsage, passThrough, chooseClaude, buildShim,
   childSession, transcriptExists, claudeSubcommands, findLatestSession, pauseUntilFor, findAccount, acquireLock,
   shiftLoginQueue, claudeCommand, widgetPid, daemonCycle, LOGIN_QUEUE, WIDGET_PID, ACCOUNTS_FILE, STATE_FILE,
+  parseKeyFile, detectProvider, providerName, providerSnapshot, probeProvider, checkProviders, durMs,
 };
 
 if (require.main === module) {
